@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "graphd"
+version = "0.1.0"
+description = "Cypher-over-WebSocket/HTTP server for embedded graph databases"
+requires-python = ">=3.8"
+license = "MIT"
+keywords = ["cypher", "graph-database", "websocket", "ladybugdb", "graphd"]
+
+[project.urls]
+Repository = "https://github.com/russellromney/strana"
+
+[tool.maturin]
+bindings = "bin"
+module-name = "graphd"
+python-source = "python"
+strip = true
