@@ -1,0 +1,219 @@
+syntax = "proto3";
+
+package strana;
+
+// ─── Values ───
+
+message NullValue {}
+
+message InternalId {
+  uint64 table = 1;
+  uint64 offset = 2;
+}
+
+message GraphValue {
+  oneof value {
+    NullValue null_value = 1;
+    bool bool_value = 2;
+    int64 int_value = 3;
+    double float_value = 4;
+    string string_value = 5;
+    ListValue list_value = 6;
+    MapValue map_value = 7;
+    NodeValue node_value = 8;
+    RelValue rel_value = 9;
+    PathValue path_value = 10;
+    UnionValue union_value = 11;
+  }
+}
+
+message ListValue {
+  repeated GraphValue values = 1;
+}
+
+message MapEntry {
+  string key = 1;
+  GraphValue value = 2;
+}
+
+message MapValue {
+  repeated MapEntry entries = 1;
+}
+
+message NodeValue {
+  InternalId id = 1;
+  string label = 2;
+  repeated MapEntry properties = 3;
+}
+
+message RelValue {
+  InternalId id = 1;
+  string label = 2;
+  InternalId src = 3;
+  InternalId dst = 4;
+  repeated MapEntry properties = 5;
+}
+
+message PathValue {
+  repeated GraphValue nodes = 1;
+  repeated GraphValue rels = 2;
+}
+
+message UnionValue {
+  string tag = 1;
+  GraphValue value = 2;
+}
+
+// ─── Row ───
+
+message Row {
+  repeated GraphValue values = 1;
+}
+
+// ─── Client messages ───
+
+message ClientMessage {
+  oneof msg {
+    Hello hello = 1;
+    Execute execute = 2;
+    Begin begin = 3;
+    Commit commit = 4;
+    Rollback rollback = 5;
+    Batch batch = 6;
+    Fetch fetch = 7;
+    CloseStream close_stream = 8;
+    Close close = 9;
+  }
+}
+
+message Hello {
+  optional string token = 1;
+}
+
+message Execute {
+  string query = 1;
+  repeated MapEntry params = 2;
+  optional string request_id = 3;
+  optional uint64 fetch_size = 4;
+}
+
+message Begin {
+  optional string mode = 1;
+  optional string request_id = 2;
+}
+
+message Commit {
+  optional string request_id = 1;
+}
+
+message Rollback {
+  optional string request_id = 1;
+}
+
+message BatchStatement {
+  string query = 1;
+  repeated MapEntry params = 2;
+}
+
+message Batch {
+  repeated BatchStatement statements = 1;
+  optional string request_id = 2;
+}
+
+message Fetch {
+  uint64 stream_id = 1;
+  optional string request_id = 2;
+}
+
+message CloseStream {
+  uint64 stream_id = 1;
+  optional string request_id = 2;
+}
+
+message Close {}
+
+// ─── Server messages ───
+
+message ServerMessage {
+  oneof msg {
+    HelloOk hello_ok = 1;
+    HelloError hello_error = 2;
+    Result result = 3;
+    Error error = 4;
+    BeginOk begin_ok = 5;
+    CommitOk commit_ok = 6;
+    RollbackOk rollback_ok = 7;
+    BatchResult batch_result = 8;
+    CloseStreamOk close_stream_ok = 9;
+    CloseOk close_ok = 10;
+  }
+}
+
+message HelloOk {
+  string version = 1;
+}
+
+message HelloError {
+  string message = 1;
+}
+
+message Result {
+  repeated string columns = 1;
+  repeated Row rows = 2;
+  double timing_ms = 3;
+  optional string request_id = 4;
+  optional uint64 stream_id = 5;
+  optional bool has_more = 6;
+}
+
+message Error {
+  string message = 1;
+  optional string request_id = 2;
+}
+
+message BeginOk {
+  optional string request_id = 1;
+}
+
+message CommitOk {
+  optional string request_id = 1;
+}
+
+message RollbackOk {
+  optional string request_id = 1;
+}
+
+message BatchResultEntry {
+  oneof entry {
+    Result result = 1;
+    Error error = 2;
+  }
+}
+
+message BatchResult {
+  repeated BatchResultEntry results = 1;
+  optional string request_id = 2;
+}
+
+message CloseStreamOk {
+  uint64 stream_id = 1;
+  optional string request_id = 2;
+}
+
+message CloseOk {}
+
+// ─── Journal ───
+
+message JournalEntry {
+  uint64 sequence = 1;
+  string query = 2;
+  repeated MapEntry params = 3;
+  int64 timestamp_ms = 4;
+}
+
+message SnapshotMeta {
+  uint64 sequence = 1;
+  bytes chain_hash = 2;
+  int64 timestamp_ms = 3;
+  string version = 4;
+}

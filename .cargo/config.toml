@@ -1,0 +1,6 @@
+[env]
+# Use prebuilt Kuzu shared library instead of building C++ from source.
+# Run `make setup-kuzu` to download the prebuilt library.
+KUZU_SHARED = "1"
+KUZU_LIBRARY_DIR = { value = "kuzu-lib", relative = true }
+KUZU_INCLUDE_DIR = { value = "kuzu-lib", relative = true }

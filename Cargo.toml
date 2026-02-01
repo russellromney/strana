@@ -1,0 +1,47 @@
+[package]
+name = "strana"
+version = "0.1.0"
+edition = "2021"
+description = "Cypher-over-WebSocket wire protocol for embedded graph databases"
+license = "MIT"
+repository = "https://github.com/cinch-labs/strana"
+
+[lib]
+name = "strana"
+
+[[bin]]
+name = "graphd"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+kuzu = { version = "0.11", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["serde", "v4"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.9"
+prost = "0.13"
+crc32c = "0.6"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+tempfile = "3"
+reqwest = { version = "0.12", features = ["json"] }
+
+# kuzu 0.11.3 has a bug: pins cxx = "=1.0.138" but allows cxx-build = "1.0",
+# which resolves to 1.0.194 and generates CXX bridge symbols with $194$ version
+# tags that don't match what cxx 1.0.138 expects. Fix: use kuzu from git with
+# the cxx-build version pinned to match.
+[patch.crates-io]
+kuzu = { git = "https://github.com/russellromney/kuzu", branch = "fix/pin-cxx-build-0.11.3" }
