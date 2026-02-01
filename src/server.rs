@@ -6,7 +6,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::auth::TokenStore;
-use crate::backend::KuzuBackend;
+use crate::backend::Backend;
 use crate::journal::{JournalSender, JournalState};
 use crate::snapshot::RetentionConfig;
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ use crate::session::{self, SessionHandle, SessionOp};
 /// Shared state for the WebSocket handler.
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<KuzuBackend>,
+    pub db: Arc<Backend>,
     /// Token store for authenticating clients.
     pub tokens: Arc<TokenStore>,
     /// How long idle cursors survive before being swept.
@@ -109,7 +109,7 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
     )
     .await;
 
-    // Spawn a per-session worker with its own Kuzu connection.
+    // Spawn a per-session worker with its own database connection.
     let session = session::spawn_session(
         state.db.clone(),
         state.cursor_timeout,

@@ -887,9 +887,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuzu"
-version = "0.11.3"
-source = "git+https://github.com/russellromney/kuzu?branch=fix%2Fpin-cxx-build-0.11.3#0a8ac5cdfb6cdf66088930b35f1d6e061a91d1a3"
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "lbug"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fa3b4608caa57f85cf2563fa2c90337bd1e567afb36c07fe1c1f98ff372b314"
 dependencies = [
  "cmake",
  "cxx",
@@ -899,12 +906,6 @@ dependencies = [
  "time",
  "uuid",
 ]
-
-[[package]]
-name = "lazy_static"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
@@ -1655,7 +1656,7 @@ dependencies = [
  "crc32c",
  "futures-util",
  "hex",
- "kuzu",
+ "lbug",
  "prost",
  "prost-build",
  "rand",

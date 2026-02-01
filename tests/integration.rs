@@ -27,9 +27,9 @@ async fn start_server_with_timeout(
     tokens: Arc<TokenStore>,
     cursor_timeout: Duration,
 ) -> ServerUrls {
-    let db_path = data_dir.join("kuzu_db");
+    let db_path = data_dir.join("db");
     let db =
-        strana::backend::KuzuBackend::open(&db_path).expect("Failed to open Kuzu database");
+        strana::backend::Backend::open(&db_path).expect("Failed to open database");
     let state = strana::server::AppState {
         db: Arc::new(db),
         tokens,
@@ -2186,8 +2186,8 @@ struct JournalServerCtx {
 }
 
 async fn start_server_with_journal(data_dir: &std::path::Path) -> JournalServerCtx {
-    let db_path = data_dir.join("kuzu_db");
-    let db = strana::backend::KuzuBackend::open(&db_path).expect("Failed to open Kuzu database");
+    let db_path = data_dir.join("db");
+    let db = strana::backend::Backend::open(&db_path).expect("Failed to open database");
     let journal_dir = data_dir.join("journal");
     let journal_state = Arc::new(strana::journal::JournalState::new());
     let journal_tx = strana::journal::spawn_journal_writer(
@@ -2587,7 +2587,7 @@ struct SnapshotServerCtx {
 async fn start_snapshot_server(data_dir: &std::path::Path) -> SnapshotServerCtx {
     std::fs::create_dir_all(data_dir).unwrap();
     let db_dir = data_dir.join("db");
-    let db = strana::backend::KuzuBackend::open(&db_dir).expect("Failed to open Kuzu database");
+    let db = strana::backend::Backend::open(&db_dir).expect("Failed to open database");
     let journal_dir = data_dir.join("journal");
     let journal_state = Arc::new(strana::journal::JournalState::new());
     let journal_tx = strana::journal::spawn_journal_writer(
@@ -2629,7 +2629,7 @@ async fn start_snapshot_server(data_dir: &std::path::Path) -> SnapshotServerCtx 
 /// Start a minimal server for read verification (no journal). DB at data_dir/db.
 async fn start_verify_server(data_dir: &std::path::Path) -> String {
     let db_dir = data_dir.join("db");
-    let db = strana::backend::KuzuBackend::open(&db_dir).expect("Failed to open Kuzu database");
+    let db = strana::backend::Backend::open(&db_dir).expect("Failed to open database");
     let state = strana::server::AppState {
         db: Arc::new(db),
         tokens: Arc::new(TokenStore::open()),
@@ -2733,7 +2733,7 @@ async fn test_snapshot_requires_journal() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("snap_nojrnl");
     let db =
-        strana::backend::KuzuBackend::open(&db_path).expect("Failed to open Kuzu database");
+        strana::backend::Backend::open(&db_path).expect("Failed to open database");
     let state = strana::server::AppState {
         db: Arc::new(db),
         tokens: Arc::new(TokenStore::open()),

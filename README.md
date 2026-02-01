@@ -2,7 +2,7 @@
 
 Strana is a wire protocol for executing [Cypher](https://opencypher.org/) queries against embedded graph databases over WebSocket. `graphd` is the server that implements it.
 
-Embedded graph databases like [Kuzu](https://kuzudb.com/) are great for a lot of use cases, but sometimes you need to access your graph over the network. Think [sqld](https://github.com/tursodatabase/libsql) for graph databases.
+Embedded graph databases like [LadybugDB](https://ladybugdb.com/) (formerly [Kuzu](https://kuzudb.com/)) are great for a lot of use cases, but sometimes you need to access your graph over the network. Think [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) for graph databases, inspired by the [Hrana](https://github.com/tursodatabase/libsql/tree/main/libsql-hrana) protocol.
 
 - **strana** — the protocol ([PROTOCOL.md](PROTOCOL.md))
 - **graphd** — the server daemon
@@ -26,7 +26,7 @@ graphd [OPTIONS]
 |------|---------|-------------|
 | `-p, --port` | `8080` | Port to listen on |
 | `--host` | `127.0.0.1` | Bind address |
-| `-d, --data-dir` | `./data` | Path to the Kuzu database directory |
+| `-d, --data-dir` | `./data` | Path to the database directory |
 | `--token <TOKEN>` | — | Require clients to authenticate with this token |
 | `--token-file <PATH>` | — | Load hashed tokens from a JSON file |
 | `--generate-token` | — | Print a new token and its SHA-256 hash, then exit |

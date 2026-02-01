@@ -19,7 +19,7 @@ mod values;
 mod wire;
 
 use auth::TokenStore;
-use backend::KuzuBackend;
+use backend::Backend;
 use config::Config;
 use server::AppState;
 
@@ -79,8 +79,8 @@ async fn main() {
     }
 
     let db_dir = config.data_dir.join("db");
-    let db = KuzuBackend::open(&db_dir).expect("Failed to open Kuzu database");
-    info!("Opened Kuzu database at {:?}", db_dir);
+    let db = Backend::open(&db_dir).expect("Failed to open database");
+    info!("Opened database at {:?}", db_dir);
 
     // Conditionally start journal writer.
     let (journal_tx, journal_state) = if config.journal {

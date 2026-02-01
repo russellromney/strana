@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::backend::KuzuBackend;
+use crate::backend::Backend;
 use crate::journal::{self, JournalCommand, JournalSender, PendingEntry};
 use crate::protocol::{BatchResultEntry, BatchStatement, ServerMessage};
-use crate::values::{self, json_params_to_kuzu, GraphValue};
+use crate::values::{self, json_params_to_lbug, GraphValue};
 
 /// An operation to be executed on the session's dedicated connection.
 pub enum SessionOp {
@@ -68,13 +68,13 @@ impl SessionHandle {
     }
 }
 
-/// Spawn a blocking session worker that owns a Kuzu connection.
+/// Spawn a blocking session worker that owns a database connection.
 ///
 /// Returns a handle for sending operations to the worker. When the handle
 /// is dropped (e.g., WebSocket disconnects), the worker exits and the
 /// connection is dropped, auto-rolling back any uncommitted transaction.
 pub fn spawn_session(
-    db: Arc<KuzuBackend>,
+    db: Arc<Backend>,
     cursor_timeout: Duration,
     journal: Option<JournalSender>,
     snapshot_lock: Arc<RwLock<()>>,
@@ -93,9 +93,10 @@ pub fn spawn_session(
 /// An open cursor holding a partially-iterated QueryResult.
 struct OpenCursor<'db> {
     columns: Vec<String>,
-    result: kuzu::QueryResult<'db>,
+    result: lbug::QueryResult<'db>,
     fetch_size: u64,
     last_accessed: Instant,
+    buffered: Option<Vec<GraphValue>>,
 }
 
 /// Send a journal entry for a successful mutation.
@@ -112,7 +113,7 @@ fn journal_entry(journal: &Option<JournalSender>, query: &str, params: &Option<s
 
 /// Blocking session worker loop. Runs on tokio's blocking thread pool.
 fn session_worker(
-    db: Arc<KuzuBackend>,
+    db: Arc<Backend>,
     rx: mpsc::UnboundedReceiver<SessionRequest>,
     cursor_timeout: Duration,
     journal: Option<JournalSender>,
@@ -168,7 +169,8 @@ fn session_worker(
                             } else {
                                 journal_entry(&journal, &raw.rewritten_query, &raw.merged_params);
                             }
-                            let (rows, has_more) = take_rows(&mut raw.query_result, fs as usize);
+                            let mut buffered = None;
+                            let (rows, has_more) = take_rows(&mut raw.query_result, fs as usize, &mut buffered);
                             if has_more {
                                 let sid = next_stream_id;
                                 next_stream_id += 1;
@@ -179,6 +181,7 @@ fn session_worker(
                                         result: raw.query_result,
                                         fetch_size: fs,
                                         last_accessed: Instant::now(),
+                                        buffered,
                                     },
                                 );
                                 ServerMessage::Result {
@@ -347,7 +350,7 @@ fn session_worker(
                     Some(cursor) => {
                         cursor.last_accessed = Instant::now();
                         let fs = cursor.fetch_size as usize;
-                        let (rows, has_more) = take_rows(&mut cursor.result, fs);
+                        let (rows, has_more) = take_rows(&mut cursor.result, fs, &mut cursor.buffered);
                         let columns = cursor.columns.clone();
                         if has_more {
                             ServerMessage::Result {
@@ -405,7 +408,7 @@ fn session_worker(
 
 /// Result of executing a query via `run_query_raw`, including journal-relevant info.
 pub(crate) struct RawExecution<'db> {
-    pub query_result: kuzu::QueryResult<'db>,
+    pub query_result: lbug::QueryResult<'db>,
     pub columns: Vec<String>,
     pub timing_ms: f64,
     /// The rewritten query (with non-deterministic functions replaced).
@@ -428,7 +431,7 @@ pub(crate) struct ExecutedQuery {
 /// Execute a query and return the raw QueryResult, column names, timing,
 /// and the rewritten query + merged params for journaling.
 fn run_query_raw<'db>(
-    conn: &kuzu::Connection<'db>,
+    conn: &lbug::Connection<'db>,
     query: &str,
     params: Option<&serde_json::Value>,
 ) -> Result<RawExecution<'db>, String> {
@@ -447,9 +450,9 @@ fn run_query_raw<'db>(
         .map_or(false, |o| !o.is_empty());
 
     let result = if has_params {
-        match json_params_to_kuzu(params.unwrap()) {
+        match json_params_to_lbug(params.unwrap()) {
             Ok(owned) => {
-                let refs: Vec<(&str, kuzu::Value)> =
+                let refs: Vec<(&str, lbug::Value)> =
                     owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                 match conn.prepare(query) {
                     Ok(mut prepared) => {
@@ -483,17 +486,30 @@ fn run_query_raw<'db>(
 }
 
 /// Take up to `limit` rows from a QueryResult. Returns (rows, has_more).
-fn take_rows(result: &mut kuzu::QueryResult<'_>, limit: usize) -> (Vec<Vec<GraphValue>>, bool) {
+/// Uses `buf` to buffer a peeked row across calls — pass `&mut None` for one-shot reads.
+fn take_rows(
+    result: &mut lbug::QueryResult<'_>,
+    limit: usize,
+    buf: &mut Option<Vec<GraphValue>>,
+) -> (Vec<Vec<GraphValue>>, bool) {
     let mut rows = Vec::new();
-    for _ in 0..limit {
-        if let Some(row) = result.next() {
-            rows.push(row.iter().map(|v| values::from_kuzu_value(v)).collect());
-        } else {
-            return (rows, false);
+    if let Some(row) = buf.take() {
+        rows.push(row);
+    }
+    while rows.len() < limit {
+        match result.next() {
+            Some(row) => rows.push(row.iter().map(|v| values::from_lbug_value(v)).collect()),
+            None => return (rows, false),
         }
     }
-    let has_more = result.has_next();
-    (rows, has_more)
+    // Peek one more to determine has_more without losing the row.
+    match result.next() {
+        Some(row) => {
+            *buf = Some(row.iter().map(|v| values::from_lbug_value(v)).collect());
+            (rows, true)
+        }
+        None => (rows, false),
+    }
 }
 
 /// Remove cursors that have been idle longer than `timeout`.
@@ -504,12 +520,12 @@ fn sweep_expired_cursors(cursors: &mut HashMap<u64, OpenCursor<'_>>, timeout: Du
 
 /// Execute a single query, collecting all rows.
 pub(crate) fn run_query(
-    conn: &kuzu::Connection<'_>,
+    conn: &lbug::Connection<'_>,
     query: &str,
     params: Option<&serde_json::Value>,
 ) -> Result<ExecutedQuery, String> {
     let mut raw = run_query_raw(conn, query, params)?;
-    let (rows, _) = take_rows(&mut raw.query_result, usize::MAX);
+    let (rows, _) = take_rows(&mut raw.query_result, usize::MAX, &mut None);
     Ok(ExecutedQuery {
         columns: raw.columns,
         rows,
@@ -523,7 +539,7 @@ pub(crate) fn run_query(
 /// Execute a batch of statements sequentially. Stops on first error.
 /// Returns the result message and a vec of journal entries for successful mutations.
 fn execute_batch(
-    conn: &kuzu::Connection<'_>,
+    conn: &lbug::Connection<'_>,
     statements: &[BatchStatement],
     request_id: Option<String>,
 ) -> (ServerMessage, Vec<PendingEntry>) {

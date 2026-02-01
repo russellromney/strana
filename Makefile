@@ -1,24 +1,24 @@
-.PHONY: setup-kuzu test build clean help
+.PHONY: setup-lbug test build clean help
 
-KUZU_VERSION := v0.11.3
-KUZU_ARCHIVE := libkuzu-osx-universal.tar.gz
+LBUG_VERSION := v0.14.1
+LBUG_ARCHIVE := liblbug-osx-universal.tar.gz
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-15s %s\n", $$1, $$2}'
 
-setup-kuzu: ## Download prebuilt Kuzu shared library
-	@mkdir -p kuzu-lib
-	@if [ ! -f kuzu-lib/libkuzu.dylib ]; then \
-		echo "Downloading Kuzu $(KUZU_VERSION) prebuilt library..."; \
-		gh release download $(KUZU_VERSION) --repo kuzudb/kuzu --pattern '$(KUZU_ARCHIVE)' --dir /tmp --clobber; \
-		tar -xzf /tmp/$(KUZU_ARCHIVE) -C kuzu-lib/; \
-		echo "Done. kuzu-lib/ ready."; \
+setup-lbug: ## Download prebuilt LadybugDB shared library
+	@mkdir -p lbug-lib
+	@if [ ! -f lbug-lib/liblbug.dylib ]; then \
+		echo "Downloading LadybugDB $(LBUG_VERSION) prebuilt library..."; \
+		gh release download $(LBUG_VERSION) --repo LadybugDB/ladybug --pattern '$(LBUG_ARCHIVE)' --dir /tmp --clobber; \
+		tar -xzf /tmp/$(LBUG_ARCHIVE) -C lbug-lib/; \
+		echo "Done. lbug-lib/ ready."; \
 	else \
-		echo "kuzu-lib/libkuzu.dylib already exists."; \
+		echo "lbug-lib/liblbug.dylib already exists."; \
 	fi
 
 test: ## Run all tests
-	DYLD_LIBRARY_PATH=$(CURDIR)/kuzu-lib ~/.cargo/bin/cargo test
+	DYLD_LIBRARY_PATH=$(CURDIR)/lbug-lib ~/.cargo/bin/cargo test
 
 build: ## Build the project
 	~/.cargo/bin/cargo build

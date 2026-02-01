@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
-kuzu = { version = "0.11", default-features = false }
+lbug = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -38,10 +38,3 @@ tokio-tungstenite = "0.26"
 futures-util = "0.3"
 tempfile = "3"
 reqwest = { version = "0.12", features = ["json"] }
-
-# kuzu 0.11.3 has a bug: pins cxx = "=1.0.138" but allows cxx-build = "1.0",
-# which resolves to 1.0.194 and generates CXX bridge symbols with $194$ version
-# tags that don't match what cxx 1.0.138 expects. Fix: use kuzu from git with
-# the cxx-build version pinned to match.
-[patch.crates-io]
-kuzu = { git = "https://github.com/russellromney/kuzu", branch = "fix/pin-cxx-build-0.11.3" }

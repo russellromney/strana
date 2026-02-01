@@ -1,8 +1,8 @@
-use crate::backend::KuzuBackend;
+use crate::backend::Backend;
 use crate::journal::{
     self, JournalCommand, JournalReader, JournalSender, JournalState,
 };
-use crate::values::json_params_to_kuzu;
+use crate::values::json_params_to_lbug;
 use crate::wire::proto;
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -73,7 +73,7 @@ fn copy_dir(src: &Path, dst: &Path, exclude: &[&str]) -> Result<(), String> {
 /// a copy of the database files plus a `snapshot.meta` protobuf file.
 pub fn create_snapshot(
     data_dir: &Path,
-    db: &KuzuBackend,
+    db: &Backend,
     journal: &JournalSender,
     journal_state: &JournalState,
     retention_config: &RetentionConfig,
@@ -218,7 +218,7 @@ pub fn restore(data_dir: &Path, snapshot_path: Option<&Path>) -> Result<(), Stri
     // 3. Open DB and replay journal entries.
     let journal_dir = data_dir.join("journal");
     if journal_dir.exists() {
-        let db = KuzuBackend::open(&db_path)?;
+        let db = Backend::open(&db_path)?;
         let conn = db.connection()?;
 
         // Use the snapshot's chain hash so the reader can validate entries even
@@ -253,7 +253,7 @@ pub fn restore(data_dir: &Path, snapshot_path: Option<&Path>) -> Result<(), Stri
 /// Execute a single journal entry on a connection (no rewriter — journal
 /// already stores rewritten queries with concrete param values).
 fn execute_restore_entry(
-    conn: &kuzu::Connection<'_>,
+    conn: &lbug::Connection<'_>,
     query: &str,
     params: &Option<serde_json::Value>,
 ) -> Result<(), String> {
@@ -263,8 +263,8 @@ fn execute_restore_entry(
         .map_or(false, |o| !o.is_empty());
 
     if has_params {
-        let owned = json_params_to_kuzu(params.as_ref().unwrap())?;
-        let refs: Vec<(&str, kuzu::Value)> =
+        let owned = json_params_to_lbug(params.as_ref().unwrap())?;
+        let refs: Vec<(&str, lbug::Value)> =
             owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         let mut prepared = conn.prepare(query).map_err(|e| format!("{e}"))?;
         conn.execute(&mut prepared, refs)

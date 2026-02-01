@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
 use crate::auth::TokenStore;
-use crate::backend::KuzuBackend;
+use crate::backend::Backend;
 use crate::journal::{self, JournalCommand, JournalSender, PendingEntry};
 use crate::protocol::BatchResultEntry;
 use crate::session::run_query;
@@ -293,7 +293,7 @@ fn journal_entry(journal: &Option<JournalSender>, query: &str, params: &Option<s
 // ─── Blocking execution helpers ───
 
 fn execute_on_connection(
-    db: &Arc<KuzuBackend>,
+    db: &Arc<Backend>,
     query: &str,
     params: Option<&serde_json::Value>,
     journal: &Option<JournalSender>,
@@ -322,7 +322,7 @@ fn execute_on_connection(
 }
 
 fn execute_batch_on_connection(
-    db: &Arc<KuzuBackend>,
+    db: &Arc<Backend>,
     statements: &[StatementEntry],
     journal: &Option<JournalSender>,
     snapshot_lock: &Arc<RwLock<()>>,
@@ -359,7 +359,7 @@ fn execute_batch_on_connection(
 }
 
 fn execute_pipeline_on_connection(
-    db: &Arc<KuzuBackend>,
+    db: &Arc<Backend>,
     statements: &[StatementEntry],
     journal: &Option<JournalSender>,
     snapshot_lock: &Arc<RwLock<()>>,
