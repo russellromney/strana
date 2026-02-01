@@ -14,7 +14,7 @@ cargo build --release
 ./target/release/graphd
 ```
 
-`graphd` is now listening on `127.0.0.1:8080`. Connect any WebSocket client to `/ws` and start running Cypher queries.
+`graphd` is now listening on `127.0.0.1:7688`. Connect any WebSocket client to `/ws` and start running Cypher queries.
 
 ## Usage
 
@@ -24,7 +24,7 @@ graphd [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-p, --port` | `8080` | Port to listen on |
+| `-p, --port` | `7688` | Port to listen on |
 | `--host` | `127.0.0.1` | Bind address |
 | `-d, --data-dir` | `./data` | Path to the database directory |
 | `--token <TOKEN>` | — | Require clients to authenticate with this token |

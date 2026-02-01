@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(name = "graphd", about = "Cypher-over-WebSocket server for embedded graph databases")]
 pub struct Config {
     /// Port to listen on.
-    #[arg(short, long, default_value = "8080")]
+    #[arg(short, long, default_value = "7688")]
     pub port: u16,
 
     /// Bind address.
