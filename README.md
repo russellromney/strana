@@ -59,23 +59,25 @@ Client                              Server
   |<--- close_ok --------------------|
 ```
 
-### Example session
+### Example session (logical messages)
 
-```json
-→ {"type": "hello", "token": "my-secret-token"}
-← {"type": "hello_ok", "version": "0.1.0"}
+WebSocket uses protobuf binary frames (`proto/strana.proto`). HTTP uses JSON. The messages below show the logical structure:
 
-→ {"type": "execute", "query": "CREATE NODE TABLE Person(name STRING, age INT64, PRIMARY KEY(name))"}
-← {"type": "result", "columns": [], "rows": [], "timing_ms": 1.2}
+```
+→ hello { token: "my-secret-token" }
+← hello_ok { version: "0.1.0" }
 
-→ {"type": "execute", "query": "CREATE (:Person {name: 'Alice', age: 30})"}
-← {"type": "result", "columns": [], "rows": [], "timing_ms": 0.5}
+→ execute { query: "CREATE NODE TABLE Person(name STRING, age INT64, PRIMARY KEY(name))" }
+← result { columns: [], rows: [], timing_ms: 1.2 }
 
-→ {"type": "execute", "query": "MATCH (p:Person) RETURN p.name, p.age"}
-← {"type": "result", "columns": ["p.name", "p.age"], "rows": [["Alice", 30]], "timing_ms": 0.3}
+→ execute { query: "CREATE (:Person {name: 'Alice', age: 30})" }
+← result { columns: [], rows: [], timing_ms: 0.5 }
 
-→ {"type": "close"}
-← {"type": "close_ok"}
+→ execute { query: "MATCH (p:Person) RETURN p.name, p.age" }
+← result { columns: ["p.name", "p.age"], rows: [["Alice", 30]], timing_ms: 0.3 }
+
+→ close
+← close_ok
 ```
 
 ## Authentication

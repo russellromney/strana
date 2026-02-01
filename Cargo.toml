@@ -1,16 +1,16 @@
 [package]
-name = "strana"
+name = "graphd"
 version = "0.1.0"
 edition = "2021"
-description = "Cypher-over-WebSocket wire protocol for embedded graph databases"
+description = "Cypher-over-WebSocket/HTTP server for embedded graph databases"
 license = "MIT"
 repository = "https://github.com/russellromney/strana"
 readme = "README.md"
-keywords = ["cypher", "graph-database", "websocket", "ladybugdb"]
+keywords = ["cypher", "graph-database", "websocket", "ladybugdb", "graphd"]
 categories = ["database", "network-programming"]
 
 [lib]
-name = "strana"
+name = "graphd"
 
 [[bin]]
 name = "graphd"
@@ -32,6 +32,10 @@ hex = "0.4"
 rand = "0.9"
 prost = "0.13"
 crc32c = "0.6"
+aws-config = "1"
+aws-sdk-s3 = "1"
+tar = "0.4"
+zstd = "0.13"
 
 [build-dependencies]
 prost-build = "0.13"

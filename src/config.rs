@@ -60,4 +60,12 @@ pub struct Config {
     /// GFS retention: number of monthly snapshots to keep.
     #[arg(long, default_value = "3")]
     pub retain_monthly: usize,
+
+    /// S3 bucket for snapshot uploads (e.g. strana-snapshots).
+    #[arg(long, env = "STRANA_S3_BUCKET")]
+    pub s3_bucket: Option<String>,
+
+    /// S3 key prefix for snapshots (e.g. backups/mydb/).
+    #[arg(long, env = "STRANA_S3_PREFIX", default_value = "")]
+    pub s3_prefix: String,
 }

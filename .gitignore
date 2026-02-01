@@ -2,3 +2,4 @@
 /lbug-lib
 /kuzu-lib
 /kuzu-patched
+.env*

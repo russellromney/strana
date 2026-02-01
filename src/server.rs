@@ -33,6 +33,10 @@ pub struct AppState {
     pub snapshot_lock: Arc<RwLock<()>>,
     /// GFS retention config for snapshot cleanup.
     pub retention_config: RetentionConfig,
+    /// S3 bucket for snapshot uploads (None if disabled).
+    pub s3_bucket: Option<String>,
+    /// S3 key prefix for snapshots.
+    pub s3_prefix: String,
 }
 
 /// Axum handler: upgrade HTTP to WebSocket.

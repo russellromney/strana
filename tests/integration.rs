@@ -2,8 +2,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use strana::auth::TokenStore;
-use strana::wire::proto;
+use graphd::auth::TokenStore;
+use graphd::wire::proto;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
@@ -29,8 +29,8 @@ async fn start_server_with_timeout(
 ) -> ServerUrls {
     let db_path = data_dir.join("db");
     let db =
-        strana::backend::Backend::open(&db_path).expect("Failed to open database");
-    let state = strana::server::AppState {
+        graphd::backend::Backend::open(&db_path).expect("Failed to open database");
+    let state = graphd::server::AppState {
         db: Arc::new(db),
         tokens,
         cursor_timeout,
@@ -38,13 +38,15 @@ async fn start_server_with_timeout(
         journal_state: None,
         data_dir: db_path,
         snapshot_lock: Arc::new(std::sync::RwLock::new(())),
-        retention_config: strana::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        retention_config: graphd::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        s3_bucket: None,
+        s3_prefix: String::new(),
     };
     let app = axum::Router::new()
-        .route("/ws", axum::routing::get(strana::server::ws_upgrade))
-        .route("/v1/execute", axum::routing::post(strana::http::execute_handler))
-        .route("/v1/batch", axum::routing::post(strana::http::batch_handler))
-        .route("/v1/pipeline", axum::routing::post(strana::http::pipeline_handler))
+        .route("/ws", axum::routing::get(graphd::server::ws_upgrade))
+        .route("/v1/execute", axum::routing::post(graphd::http::execute_handler))
+        .route("/v1/batch", axum::routing::post(graphd::http::batch_handler))
+        .route("/v1/pipeline", axum::routing::post(graphd::http::pipeline_handler))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2181,22 +2183,22 @@ async fn test_rewriter_batch_uuid() {
 struct JournalServerCtx {
     ws: String,
     http: String,
-    journal_tx: strana::journal::JournalSender,
+    journal_tx: graphd::journal::JournalSender,
     journal_dir: std::path::PathBuf,
 }
 
 async fn start_server_with_journal(data_dir: &std::path::Path) -> JournalServerCtx {
     let db_path = data_dir.join("db");
-    let db = strana::backend::Backend::open(&db_path).expect("Failed to open database");
+    let db = graphd::backend::Backend::open(&db_path).expect("Failed to open database");
     let journal_dir = data_dir.join("journal");
-    let journal_state = Arc::new(strana::journal::JournalState::new());
-    let journal_tx = strana::journal::spawn_journal_writer(
+    let journal_state = Arc::new(graphd::journal::JournalState::new());
+    let journal_tx = graphd::journal::spawn_journal_writer(
         journal_dir.clone(),
         64 * 1024 * 1024,
         50,
         journal_state.clone(),
     );
-    let state = strana::server::AppState {
+    let state = graphd::server::AppState {
         db: Arc::new(db),
         tokens: Arc::new(TokenStore::open()),
         cursor_timeout: Duration::from_secs(30),
@@ -2204,14 +2206,16 @@ async fn start_server_with_journal(data_dir: &std::path::Path) -> JournalServerC
         journal_state: Some(journal_state),
         data_dir: db_path.clone(),
         snapshot_lock: Arc::new(std::sync::RwLock::new(())),
-        retention_config: strana::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        retention_config: graphd::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        s3_bucket: None,
+        s3_prefix: String::new(),
     };
     let app = axum::Router::new()
-        .route("/ws", axum::routing::get(strana::server::ws_upgrade))
-        .route("/v1/execute", axum::routing::post(strana::http::execute_handler))
-        .route("/v1/batch", axum::routing::post(strana::http::batch_handler))
-        .route("/v1/pipeline", axum::routing::post(strana::http::pipeline_handler))
-        .route("/v1/snapshot", axum::routing::post(strana::http::snapshot_handler))
+        .route("/ws", axum::routing::get(graphd::server::ws_upgrade))
+        .route("/v1/execute", axum::routing::post(graphd::http::execute_handler))
+        .route("/v1/batch", axum::routing::post(graphd::http::batch_handler))
+        .route("/v1/pipeline", axum::routing::post(graphd::http::pipeline_handler))
+        .route("/v1/snapshot", axum::routing::post(graphd::http::snapshot_handler))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2225,14 +2229,14 @@ async fn start_server_with_journal(data_dir: &std::path::Path) -> JournalServerC
     }
 }
 
-fn flush_journal(tx: &strana::journal::JournalSender) {
+fn flush_journal(tx: &graphd::journal::JournalSender) {
     let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-    tx.send(strana::journal::JournalCommand::Flush(ack_tx)).unwrap();
+    tx.send(graphd::journal::JournalCommand::Flush(ack_tx)).unwrap();
     ack_rx.recv().unwrap();
 }
 
-fn read_journal_entries(dir: &std::path::Path) -> Vec<strana::journal::JournalReaderEntry> {
-    match strana::journal::JournalReader::open(dir) {
+fn read_journal_entries(dir: &std::path::Path) -> Vec<graphd::journal::JournalReaderEntry> {
+    match graphd::journal::JournalReader::open(dir) {
         Ok(reader) => reader.map(|r| r.unwrap()).collect(),
         Err(_) => vec![],
     }
@@ -2562,7 +2566,7 @@ async fn test_journal_params_preserved() {
     let name_param = params.iter().find(|p| p.key == "name").unwrap();
     let name_val = name_param.value.as_ref().unwrap();
     match &name_val.value {
-        Some(strana::wire::proto::graph_value::Value::StringValue(s)) => {
+        Some(graphd::wire::proto::graph_value::Value::StringValue(s)) => {
             assert_eq!(s, "Alice");
         }
         other => panic!("Expected string param, got: {other:?}"),
@@ -2577,7 +2581,7 @@ struct SnapshotServerCtx {
     #[allow(dead_code)]
     ws: String,
     http: String,
-    journal_tx: strana::journal::JournalSender,
+    journal_tx: graphd::journal::JournalSender,
     journal_dir: std::path::PathBuf,
     data_dir: std::path::PathBuf,
 }
@@ -2587,16 +2591,16 @@ struct SnapshotServerCtx {
 async fn start_snapshot_server(data_dir: &std::path::Path) -> SnapshotServerCtx {
     std::fs::create_dir_all(data_dir).unwrap();
     let db_dir = data_dir.join("db");
-    let db = strana::backend::Backend::open(&db_dir).expect("Failed to open database");
+    let db = graphd::backend::Backend::open(&db_dir).expect("Failed to open database");
     let journal_dir = data_dir.join("journal");
-    let journal_state = Arc::new(strana::journal::JournalState::new());
-    let journal_tx = strana::journal::spawn_journal_writer(
+    let journal_state = Arc::new(graphd::journal::JournalState::new());
+    let journal_tx = graphd::journal::spawn_journal_writer(
         journal_dir.clone(),
         64 * 1024 * 1024,
         50,
         journal_state.clone(),
     );
-    let state = strana::server::AppState {
+    let state = graphd::server::AppState {
         db: Arc::new(db),
         tokens: Arc::new(TokenStore::open()),
         cursor_timeout: Duration::from_secs(30),
@@ -2604,14 +2608,16 @@ async fn start_snapshot_server(data_dir: &std::path::Path) -> SnapshotServerCtx 
         journal_state: Some(journal_state),
         data_dir: data_dir.to_path_buf(),
         snapshot_lock: Arc::new(std::sync::RwLock::new(())),
-        retention_config: strana::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        retention_config: graphd::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        s3_bucket: None,
+        s3_prefix: String::new(),
     };
     let app = axum::Router::new()
-        .route("/ws", axum::routing::get(strana::server::ws_upgrade))
-        .route("/v1/execute", axum::routing::post(strana::http::execute_handler))
-        .route("/v1/batch", axum::routing::post(strana::http::batch_handler))
-        .route("/v1/pipeline", axum::routing::post(strana::http::pipeline_handler))
-        .route("/v1/snapshot", axum::routing::post(strana::http::snapshot_handler))
+        .route("/ws", axum::routing::get(graphd::server::ws_upgrade))
+        .route("/v1/execute", axum::routing::post(graphd::http::execute_handler))
+        .route("/v1/batch", axum::routing::post(graphd::http::batch_handler))
+        .route("/v1/pipeline", axum::routing::post(graphd::http::pipeline_handler))
+        .route("/v1/snapshot", axum::routing::post(graphd::http::snapshot_handler))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2629,8 +2635,8 @@ async fn start_snapshot_server(data_dir: &std::path::Path) -> SnapshotServerCtx 
 /// Start a minimal server for read verification (no journal). DB at data_dir/db.
 async fn start_verify_server(data_dir: &std::path::Path) -> String {
     let db_dir = data_dir.join("db");
-    let db = strana::backend::Backend::open(&db_dir).expect("Failed to open database");
-    let state = strana::server::AppState {
+    let db = graphd::backend::Backend::open(&db_dir).expect("Failed to open database");
+    let state = graphd::server::AppState {
         db: Arc::new(db),
         tokens: Arc::new(TokenStore::open()),
         cursor_timeout: Duration::from_secs(30),
@@ -2638,10 +2644,12 @@ async fn start_verify_server(data_dir: &std::path::Path) -> String {
         journal_state: None,
         data_dir: data_dir.to_path_buf(),
         snapshot_lock: Arc::new(std::sync::RwLock::new(())),
-        retention_config: strana::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        retention_config: graphd::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        s3_bucket: None,
+        s3_prefix: String::new(),
     };
     let app = axum::Router::new()
-        .route("/v1/execute", axum::routing::post(strana::http::execute_handler))
+        .route("/v1/execute", axum::routing::post(graphd::http::execute_handler))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2733,8 +2741,8 @@ async fn test_snapshot_requires_journal() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("snap_nojrnl");
     let db =
-        strana::backend::Backend::open(&db_path).expect("Failed to open database");
-    let state = strana::server::AppState {
+        graphd::backend::Backend::open(&db_path).expect("Failed to open database");
+    let state = graphd::server::AppState {
         db: Arc::new(db),
         tokens: Arc::new(TokenStore::open()),
         cursor_timeout: Duration::from_secs(30),
@@ -2742,12 +2750,14 @@ async fn test_snapshot_requires_journal() {
         journal_state: None,
         data_dir: db_path,
         snapshot_lock: Arc::new(std::sync::RwLock::new(())),
-        retention_config: strana::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        retention_config: graphd::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        s3_bucket: None,
+        s3_prefix: String::new(),
     };
     let app = axum::Router::new()
         .route(
             "/v1/snapshot",
-            axum::routing::post(strana::http::snapshot_handler),
+            axum::routing::post(graphd::http::snapshot_handler),
         )
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2800,7 +2810,7 @@ async fn test_snapshot_meta_persisted() {
     // Read and verify snapshot.meta protobuf
     let meta_bytes =
         std::fs::read(std::path::Path::new(&snap_path).join("snapshot.meta")).unwrap();
-    let meta = <strana::wire::proto::SnapshotMeta as prost::Message>::decode(
+    let meta = <graphd::wire::proto::SnapshotMeta as prost::Message>::decode(
         meta_bytes.as_slice(),
     )
     .unwrap();
@@ -2855,7 +2865,7 @@ async fn test_snapshot_restore_basic() {
     );
 
     // Run restore
-    strana::snapshot::restore(restore_dir.path(), None).unwrap();
+    graphd::snapshot::restore(restore_dir.path(), None).unwrap();
 
     // Start a verification server at the restored directory
     let verify_http = start_verify_server(restore_dir.path()).await;
@@ -2930,7 +2940,7 @@ async fn test_snapshot_restore_with_journal_replay() {
     );
 
     // Restore: should apply snapshot + replay 3 post-snapshot journal entries
-    strana::snapshot::restore(&restore_data, None).unwrap();
+    graphd::snapshot::restore(&restore_data, None).unwrap();
 
     // Verify ALL 6 rows are present
     let verify_http = start_verify_server(&restore_data).await;
@@ -2994,7 +3004,7 @@ async fn test_snapshot_restore_empty_journal_replay() {
     );
 
     // Restore — nothing after snapshot to replay
-    strana::snapshot::restore(&restore_data, None).unwrap();
+    graphd::snapshot::restore(&restore_data, None).unwrap();
 
     let verify_http = start_verify_server(&restore_data).await;
     let rows = query_rows(&verify_http, "MATCH (n:SnapEmpty) RETURN n.id").await;
@@ -3013,7 +3023,7 @@ async fn test_snapshot_gfs_retention_integration() {
     for i in 1..=10u64 {
         let snap = snapshots_dir.join(format!("{:016}", i));
         std::fs::create_dir_all(&snap).unwrap();
-        let meta = strana::wire::proto::SnapshotMeta {
+        let meta = graphd::wire::proto::SnapshotMeta {
             sequence: i,
             chain_hash: vec![0u8; 32],
             timestamp_ms: i as i64 * 86_400_000, // 1 day apart
@@ -3027,10 +3037,10 @@ async fn test_snapshot_gfs_retention_integration() {
     }
 
     // Apply retention: keep 3 daily, 2 weekly, 1 monthly
-    strana::snapshot::apply_retention(
+    graphd::snapshot::apply_retention(
         &snapshots_dir,
         &journal_dir,
-        &strana::snapshot::RetentionConfig {
+        &graphd::snapshot::RetentionConfig {
             daily: 3,
             weekly: 2,
             monthly: 1,
@@ -3123,7 +3133,7 @@ async fn test_snapshot_restore_specific_path() {
         &restore_dir.path().join("journal"),
     );
 
-    strana::snapshot::restore(
+    graphd::snapshot::restore(
         restore_dir.path(),
         Some(std::path::Path::new(&snap1_path)),
     )

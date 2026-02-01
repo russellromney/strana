@@ -275,6 +275,132 @@ fn execute_restore_entry(
     Ok(())
 }
 
+// ─── S3 upload / download ───
+
+/// Tar + zstd-compress a snapshot directory and upload it to S3.
+pub async fn upload_snapshot_s3(
+    snap_dir: &Path,
+    bucket: &str,
+    prefix: &str,
+    sequence: u64,
+) -> Result<String, String> {
+    let key = format!("{}{:016}.tar.zst", prefix, sequence);
+
+    // Tar + zstd the snapshot directory into memory.
+    let body = {
+        let snap_dir = snap_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || tar_zstd_dir(&snap_dir))
+            .await
+            .map_err(|e| format!("Tar task failed: {e}"))??
+    };
+
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let client = aws_sdk_s3::Client::new(&config);
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(&key)
+        .body(body.into())
+        .send()
+        .await
+        .map_err(|e| format!("S3 upload failed: {e}"))?;
+
+    info!("Snapshot uploaded to s3://{bucket}/{key}");
+    Ok(key)
+}
+
+/// Download a snapshot tarball from S3 and extract it to `dest_dir`.
+pub async fn download_snapshot_s3(
+    bucket: &str,
+    key: &str,
+    dest_dir: &Path,
+) -> Result<(), String> {
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let client = aws_sdk_s3::Client::new(&config);
+
+    let resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| format!("S3 download failed: {e}"))?;
+
+    let bytes = resp
+        .body
+        .collect()
+        .await
+        .map_err(|e| format!("S3 read body failed: {e}"))?
+        .into_bytes();
+
+    let dest = dest_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || untar_zstd(&bytes, &dest))
+        .await
+        .map_err(|e| format!("Untar task failed: {e}"))??;
+
+    info!("Snapshot downloaded from s3://{bucket}/{key}");
+    Ok(())
+}
+
+/// Find the latest snapshot key in the bucket with the given prefix.
+pub async fn find_latest_snapshot_s3(
+    bucket: &str,
+    prefix: &str,
+) -> Result<String, String> {
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let client = aws_sdk_s3::Client::new(&config);
+
+    let resp = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .send()
+        .await
+        .map_err(|e| format!("S3 list failed: {e}"))?;
+
+    let contents = resp.contents();
+    if contents.is_empty() {
+        return Err("No snapshots found in S3 bucket".to_string());
+    }
+
+    // Keys are zero-padded sequence numbers, so lexicographic max = latest.
+    let latest = contents
+        .iter()
+        .filter_map(|obj| obj.key())
+        .filter(|k| k.ends_with(".tar.zst"))
+        .max()
+        .ok_or_else(|| "No snapshot tarballs found in S3 bucket".to_string())?;
+
+    Ok(latest.to_string())
+}
+
+fn tar_zstd_dir(dir: &Path) -> Result<Vec<u8>, String> {
+    let buf = Vec::new();
+    let encoder = zstd::Encoder::new(buf, 3).map_err(|e| format!("Zstd init failed: {e}"))?;
+    let mut tar = tar::Builder::new(encoder);
+    tar.append_dir_all(".", dir)
+        .map_err(|e| format!("Tar append failed: {e}"))?;
+    let encoder = tar
+        .into_inner()
+        .map_err(|e| format!("Tar finish failed: {e}"))?;
+    let buf = encoder
+        .finish()
+        .map_err(|e| format!("Zstd finish failed: {e}"))?;
+    Ok(buf)
+}
+
+fn untar_zstd(data: &[u8], dest: &Path) -> Result<(), String> {
+    let decoder =
+        zstd::Decoder::new(data).map_err(|e| format!("Zstd decode init failed: {e}"))?;
+    let mut archive = tar::Archive::new(decoder);
+    std::fs::create_dir_all(dest).map_err(|e| format!("Create dest dir failed: {e}"))?;
+    archive
+        .unpack(dest)
+        .map_err(|e| format!("Tar unpack failed: {e}"))?;
+    Ok(())
+}
+
 // ─── GFS retention ───
 
 /// List all snapshots in the given directory, reading their metadata.

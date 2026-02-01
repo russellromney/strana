@@ -28,7 +28,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "strana=info".into()),
+                .unwrap_or_else(|_| "graphd=info".into()),
         )
         .init();
 
@@ -66,6 +66,28 @@ async fn main() {
 
     // Handle --restore: restore from snapshot, replay journal, then exit.
     if config.restore {
+        // If S3 bucket is set and no local --snapshot path, download from S3 first.
+        if let (Some(ref bucket), None) = (&config.s3_bucket, &config.snapshot) {
+            let snapshots_dir = config.data_dir.join("snapshots");
+            info!("Downloading latest snapshot from S3...");
+            let rt = tokio::runtime::Handle::current();
+            let key = rt
+                .block_on(snapshot::find_latest_snapshot_s3(bucket, &config.s3_prefix))
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to find S3 snapshot: {e}");
+                    std::process::exit(1);
+                });
+            // Extract sequence from key to create the right local directory.
+            let stem = key.trim_end_matches(".tar.zst");
+            let seq_str = stem.rsplit('/').next().unwrap_or(stem);
+            let snap_dir = snapshots_dir.join(seq_str);
+            rt.block_on(snapshot::download_snapshot_s3(bucket, &key, &snap_dir))
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to download S3 snapshot: {e}");
+                    std::process::exit(1);
+                });
+        }
+
         match snapshot::restore(&config.data_dir, config.snapshot.as_deref()) {
             Ok(()) => {
                 info!("Restore completed successfully");
@@ -122,7 +144,13 @@ async fn main() {
             weekly: config.retain_weekly,
             monthly: config.retain_monthly,
         },
+        s3_bucket: config.s3_bucket.clone(),
+        s3_prefix: config.s3_prefix.clone(),
     };
+
+    if state.s3_bucket.is_some() {
+        info!("S3 snapshots: enabled (bucket={})", state.s3_bucket.as_ref().unwrap());
+    }
 
     let app = Router::new()
         .route("/ws", get(server::ws_upgrade))

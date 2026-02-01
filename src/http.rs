@@ -250,6 +250,8 @@ pub async fn snapshot_handler(
     let data_dir = state.data_dir.clone();
     let lock = state.snapshot_lock.clone();
     let retention = state.retention_config.clone();
+    let s3_bucket = state.s3_bucket.clone();
+    let s3_prefix = state.s3_prefix.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         // Write lock blocks all mutations from executing + journaling.
@@ -260,18 +262,34 @@ pub async fn snapshot_handler(
     .unwrap();
 
     match result {
-        Ok(info) => respond(
-            proto,
-            StatusCode::OK,
-            &HttpResult::Result {
-                columns: vec!["sequence".into(), "path".into()],
-                rows: vec![vec![
-                    GraphValue::Int(info.sequence as i64),
-                    GraphValue::String(info.path.display().to_string()),
-                ]],
-                timing_ms: 0.0,
-            },
-        ),
+        Ok(info) => {
+            // Upload to S3 if configured (best-effort — don't fail the response).
+            if let Some(ref bucket) = s3_bucket {
+                if let Err(e) = crate::snapshot::upload_snapshot_s3(
+                    &info.path,
+                    bucket,
+                    &s3_prefix,
+                    info.sequence,
+                )
+                .await
+                {
+                    tracing::warn!("S3 snapshot upload failed: {e}");
+                }
+            }
+
+            respond(
+                proto,
+                StatusCode::OK,
+                &HttpResult::Result {
+                    columns: vec!["sequence".into(), "path".into()],
+                    rows: vec![vec![
+                        GraphValue::Int(info.sequence as i64),
+                        GraphValue::String(info.path.display().to_string()),
+                    ]],
+                    timing_ms: 0.0,
+                },
+            )
+        }
         Err(e) => error_response(proto, StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
