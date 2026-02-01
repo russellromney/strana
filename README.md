@@ -32,9 +32,6 @@ graphd [OPTIONS]
 | `--generate-token` | — | Print a new token and its SHA-256 hash, then exit |
 
 ```bash
-# Open access (no auth)
-graphd --port 9090 --data-dir ./my-graph
-
 # Single token
 graphd --token my-secret-token
 

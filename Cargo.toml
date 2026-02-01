@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Cypher-over-WebSocket wire protocol for embedded graph databases"
 license = "MIT"
-repository = "https://github.com/cinch-labs/strana"
+repository = "https://github.com/russellromney/strana"
+readme = "README.md"
+keywords = ["cypher", "graph-database", "websocket", "ladybugdb"]
+categories = ["database", "network-programming"]
 
 [lib]
 name = "strana"
