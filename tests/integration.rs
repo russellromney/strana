@@ -2573,6 +2573,117 @@ async fn test_journal_params_preserved() {
     }
 }
 
+#[tokio::test]
+async fn test_journal_array_params_roundtrip() {
+    // Verify that array/vector params survive journal serialization + restore replay.
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = start_snapshot_server(dir.path()).await;
+    let client = http_client();
+
+    // Create a table with array columns (STRING[] and DOUBLE[])
+    client
+        .post(format!("{}/v1/execute", ctx.http))
+        .json(&json!({"query": "CREATE NODE TABLE JnlArr(id INT64, tags STRING[], embedding DOUBLE[], PRIMARY KEY(id))"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert with array params via HTTP (JSON)
+    let resp = client
+        .post(format!("{}/v1/execute", ctx.http))
+        .json(&json!({
+            "query": "CREATE (:JnlArr {id: $id, tags: $tags, embedding: $embedding})",
+            "params": {
+                "id": 1,
+                "tags": ["rust", "graph", "database"],
+                "embedding": [0.1, 0.2, 0.3, 0.4, 0.5]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "result", "INSERT with array params failed: {body}");
+
+    // Verify data is there
+    let rows = query_rows(&ctx.http, "MATCH (n:JnlArr) RETURN n.id, n.tags, n.embedding").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_i64().unwrap(), 1);
+
+    // Take snapshot
+    let resp = client
+        .post(format!("{}/v1/snapshot", ctx.http))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Insert another row with arrays AFTER snapshot (journal-only)
+    let resp = client
+        .post(format!("{}/v1/execute", ctx.http))
+        .json(&json!({
+            "query": "CREATE (:JnlArr {id: $id, tags: $tags, embedding: $embedding})",
+            "params": {
+                "id": 2,
+                "tags": ["python", "ai"],
+                "embedding": [0.6, 0.7, 0.8, 0.9, 1.0]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "result", "Post-snapshot INSERT failed: {body}");
+
+    flush_journal(&ctx.journal_tx);
+
+    // Restore from snapshot + replay journal (which contains the array-param entry)
+    let restore_dir = tempfile::tempdir().unwrap();
+    let restore_data = restore_dir.path();
+    std::fs::create_dir_all(restore_data).unwrap();
+    copy_dir_all(
+        &ctx.data_dir.join("snapshots"),
+        &restore_data.join("snapshots"),
+    );
+    copy_dir_all(
+        &ctx.data_dir.join("journal"),
+        &restore_data.join("journal"),
+    );
+
+    graphd::snapshot::restore(restore_data, None).unwrap();
+
+    // Verify BOTH rows survive (row 1 from snapshot, row 2 from journal replay with array params)
+    let verify_http = start_verify_server(restore_data).await;
+    let rows = query_rows(
+        &verify_http,
+        "MATCH (n:JnlArr) RETURN n.id, n.tags, n.embedding ORDER BY n.id",
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "Expected 2 rows after restore + array-param journal replay, got {}",
+        rows.len()
+    );
+
+    // Row 1: from snapshot
+    assert_eq!(rows[0][0].as_i64().unwrap(), 1);
+    let tags1: Vec<&str> = rows[0][1].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(tags1, vec!["rust", "graph", "database"]);
+    let emb1: Vec<f64> = rows[0][2].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert_eq!(emb1.len(), 5);
+    assert!((emb1[0] - 0.1).abs() < 1e-6);
+
+    // Row 2: from journal replay (this is the key test — array params survived the roundtrip)
+    assert_eq!(rows[1][0].as_i64().unwrap(), 2);
+    let tags2: Vec<&str> = rows[1][1].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(tags2, vec!["python", "ai"]);
+    let emb2: Vec<f64> = rows[1][2].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert_eq!(emb2.len(), 5);
+    assert!((emb2[0] - 0.6).abs() < 1e-6);
+    assert!((emb2[4] - 1.0).abs() < 1e-6);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Phase 7c: Snapshots
 // ═══════════════════════════════════════════════════════════════
@@ -3154,4 +3265,498 @@ async fn test_snapshot_restore_specific_path() {
         "Expected 2 rows after restoring snap1 + journal replay, got {}",
         rows.len()
     );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tigris S3 e2e: upload snapshot → download → restore → verify
+// ═══════════════════════════════════════════════════════════════
+
+/// Load .env.test file and return key=value pairs.
+fn load_env_test() -> std::collections::HashMap<String, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env.test");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!(".env.test not found at {}: {e}", path.display()));
+    content
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.contains('='))
+        .map(|l| {
+            let (k, v) = l.split_once('=').unwrap();
+            (k.trim().to_string(), v.trim().to_string())
+        })
+        .collect()
+}
+
+/// Start a server with journal + S3 upload configured.
+async fn start_s3_snapshot_server(
+    data_dir: &std::path::Path,
+    s3_bucket: &str,
+    s3_prefix: &str,
+) -> SnapshotServerCtx {
+    std::fs::create_dir_all(data_dir).unwrap();
+    let db_dir = data_dir.join("db");
+    let db = graphd::backend::Backend::open(&db_dir).expect("Failed to open database");
+    let journal_dir = data_dir.join("journal");
+    let journal_state = Arc::new(graphd::journal::JournalState::new());
+    let journal_tx = graphd::journal::spawn_journal_writer(
+        journal_dir.clone(),
+        64 * 1024 * 1024,
+        50,
+        journal_state.clone(),
+    );
+    let state = graphd::server::AppState {
+        db: Arc::new(db),
+        tokens: Arc::new(TokenStore::open()),
+        cursor_timeout: Duration::from_secs(30),
+        journal: Some(journal_tx.clone()),
+        journal_state: Some(journal_state),
+        data_dir: data_dir.to_path_buf(),
+        snapshot_lock: Arc::new(std::sync::RwLock::new(())),
+        retention_config: graphd::snapshot::RetentionConfig { daily: 7, weekly: 4, monthly: 3 },
+        s3_bucket: Some(s3_bucket.to_string()),
+        s3_prefix: s3_prefix.to_string(),
+    };
+    let app = axum::Router::new()
+        .route("/v1/execute", axum::routing::post(graphd::http::execute_handler))
+        .route("/v1/snapshot", axum::routing::post(graphd::http::snapshot_handler))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    SnapshotServerCtx {
+        ws: format!("ws://127.0.0.1:{port}/ws"),
+        http: format!("http://127.0.0.1:{port}"),
+        journal_tx,
+        journal_dir,
+        data_dir: data_dir.to_path_buf(),
+    }
+}
+
+/// Delete all objects with a given prefix from an S3 bucket.
+async fn cleanup_s3_prefix(bucket: &str, prefix: &str) {
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let client = aws_sdk_s3::Client::new(&config);
+    let resp = client.list_objects_v2().bucket(bucket).prefix(prefix).send().await;
+    if let Ok(resp) = resp {
+        for obj in resp.contents() {
+            if let Some(key) = obj.key() {
+                let _ = client.delete_object().bucket(bucket).key(key).send().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_snapshot_tigris_upload_and_restore() {
+    // Load Tigris credentials from .env.test
+    let env = load_env_test();
+    let tigris_key = env.get("TIGRIS_ACCESS_KEY_ID")
+        .expect("TIGRIS_ACCESS_KEY_ID must be set in .env.test");
+    let tigris_secret = env.get("TIGRIS_SECRET_ACCESS_KEY")
+        .expect("TIGRIS_SECRET_ACCESS_KEY must be set in .env.test");
+    let bucket = env.get("TIGRIS_BUCKET")
+        .expect("TIGRIS_BUCKET must be set in .env.test");
+    let endpoint = env.get("TIGRIS_ENDPOINT")
+        .expect("TIGRIS_ENDPOINT must be set in .env.test");
+
+    // Set AWS env vars so aws-config picks up Tigris endpoint + credentials.
+    std::env::set_var("AWS_ACCESS_KEY_ID", tigris_key);
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", tigris_secret);
+    std::env::set_var("AWS_ENDPOINT_URL", endpoint);
+    std::env::set_var("AWS_REGION", "auto");
+
+    // Unique prefix per test run to avoid collisions.
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let prefix = format!("test-{run_id}/");
+
+    // ── Phase 1: Start server, create data, snapshot → Tigris ──
+
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = start_s3_snapshot_server(dir.path(), bucket, &prefix).await;
+    let client = http_client();
+
+    // Create schema
+    let resp = client
+        .post(format!("{}/v1/execute", ctx.http))
+        .json(&json!({"query": "CREATE NODE TABLE TigrisE2E(id INT64, name STRING, PRIMARY KEY(id))"}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "result", "CREATE TABLE failed: {body}");
+
+    // Insert 5 rows
+    for i in 1..=5 {
+        let resp = client
+            .post(format!("{}/v1/execute", ctx.http))
+            .json(&json!({"query": format!("CREATE (:TigrisE2E {{id: {i}, name: 'item{i}'}})")}))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["type"], "result", "INSERT {i} failed: {body}");
+    }
+
+    // Add 3 more rows AFTER snapshot to test journal replay
+    // (we'll snapshot first, then add these)
+
+    // Take snapshot — handler awaits S3 upload before responding
+    let resp = client
+        .post(format!("{}/v1/snapshot", ctx.http))
+        .send()
+        .await
+        .unwrap();
+    let snap_body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap_body["type"], "result", "Snapshot failed: {snap_body}");
+    let sequence = snap_body["rows"][0][0].as_i64().unwrap() as u64;
+    eprintln!("Snapshot created: sequence={sequence}");
+
+    // Insert 3 more rows AFTER the snapshot (journal-only)
+    for i in 6..=8 {
+        let resp = client
+            .post(format!("{}/v1/execute", ctx.http))
+            .json(&json!({"query": format!("CREATE (:TigrisE2E {{id: {i}, name: 'item{i}'}})")}))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["type"], "result", "INSERT {i} failed: {body}");
+    }
+    flush_journal(&ctx.journal_tx);
+
+    // ── Phase 2: Verify snapshot exists in Tigris ──
+
+    let s3_key = graphd::snapshot::find_latest_snapshot_s3(bucket, &prefix)
+        .await
+        .expect("Should find snapshot in Tigris");
+    let expected_key = format!("{prefix}{sequence:016}.tar.zst");
+    assert_eq!(s3_key, expected_key, "S3 key mismatch");
+    eprintln!("Verified in Tigris: {s3_key}");
+
+    // ── Phase 3: Download from Tigris → fresh dir → restore ──
+
+    let restore_dir = tempfile::tempdir().unwrap();
+    let restore_data = restore_dir.path();
+
+    // Download snapshot tarball from Tigris
+    let snap_dir = restore_data
+        .join("snapshots")
+        .join(format!("{sequence:016}"));
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    graphd::snapshot::download_snapshot_s3(bucket, &s3_key, &snap_dir)
+        .await
+        .expect("Should download snapshot from Tigris");
+    eprintln!("Downloaded from Tigris to {}", snap_dir.display());
+
+    // Copy journal from original server for replay
+    copy_dir_all(
+        &ctx.data_dir.join("journal"),
+        &restore_data.join("journal"),
+    );
+
+    // Restore: snapshot + journal replay
+    graphd::snapshot::restore(restore_data, None).unwrap();
+    eprintln!("Restore complete");
+
+    // ── Phase 4: Verify ALL 8 rows (5 from snapshot + 3 from journal replay) ──
+
+    let verify_http = start_verify_server(restore_data).await;
+    let rows = query_rows(
+        &verify_http,
+        "MATCH (n:TigrisE2E) RETURN n.id, n.name ORDER BY n.id",
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        8,
+        "Expected 8 rows after Tigris restore + journal replay, got {}",
+        rows.len()
+    );
+    for i in 1..=8i64 {
+        assert_eq!(rows[(i - 1) as usize][0].as_i64().unwrap(), i);
+        assert_eq!(
+            rows[(i - 1) as usize][1].as_str().unwrap(),
+            format!("item{i}")
+        );
+    }
+    eprintln!("All 8 rows verified after Tigris restore + journal replay");
+
+    // ── Phase 5: Cleanup test objects from Tigris ──
+
+    cleanup_s3_prefix(bucket, &prefix).await;
+    eprintln!("Cleaned up Tigris prefix: {prefix}");
+}
+
+// ─── Regression tests ───
+
+/// Regression: proto_params_to_json() used to drop ListValue to Null.
+/// WS clients sending array params (e.g. embedding vectors) would silently lose data.
+#[tokio::test]
+async fn test_regression_ws_proto_array_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let urls = start_server(dir.path(), Arc::new(TokenStore::open())).await;
+    let mut ws = connect(&urls.ws).await;
+
+    send(&mut ws, hello(None)).await;
+    let _ = recv(&mut ws).await;
+
+    // Create table with array columns.
+    send(
+        &mut ws,
+        execute("CREATE NODE TABLE WsArr(id INT64, tags STRING[], embedding DOUBLE[], PRIMARY KEY(id))"),
+    )
+    .await;
+    let _ = recv(&mut ws).await;
+
+    // Insert with array params via WS protobuf (this was the bug — arrays became null).
+    let list_param = |key: &str, values: Vec<proto::GraphValue>| -> proto::MapEntry {
+        proto::MapEntry {
+            key: key.into(),
+            value: Some(proto::GraphValue {
+                value: Some(proto::graph_value::Value::ListValue(proto::ListValue { values })),
+            }),
+        }
+    };
+
+    let tags = list_param(
+        "tags",
+        vec![
+            proto::GraphValue { value: Some(proto::graph_value::Value::StringValue("rust".into())) },
+            proto::GraphValue { value: Some(proto::graph_value::Value::StringValue("graph".into())) },
+        ],
+    );
+    let embedding = list_param(
+        "embedding",
+        vec![
+            proto::GraphValue { value: Some(proto::graph_value::Value::FloatValue(0.1)) },
+            proto::GraphValue { value: Some(proto::graph_value::Value::FloatValue(0.2)) },
+            proto::GraphValue { value: Some(proto::graph_value::Value::FloatValue(0.3)) },
+        ],
+    );
+
+    send(
+        &mut ws,
+        execute_full(
+            "CREATE (:WsArr {id: $id, tags: $tags, embedding: $embedding})",
+            vec![int_param("id", 1), tags, embedding],
+            None,
+            None,
+        ),
+    )
+    .await;
+    let resp = recv(&mut ws).await;
+    expect_result(&resp); // Must succeed, not error
+
+    // Query back and verify arrays came through.
+    send(
+        &mut ws,
+        execute("MATCH (n:WsArr) WHERE n.id = 1 RETURN n.tags, n.embedding"),
+    )
+    .await;
+    let resp = recv(&mut ws).await;
+    let r = expect_result(&resp);
+    assert_eq!(r.rows.len(), 1, "Expected 1 row");
+
+    // Verify tags array
+    let tags_val = &r.rows[0].values[0];
+    match tags_val.value.as_ref().unwrap() {
+        proto::graph_value::Value::ListValue(list) => {
+            assert_eq!(list.values.len(), 2, "Expected 2 tags");
+            assert_eq!(val_str(&list.values[0]), "rust");
+            assert_eq!(val_str(&list.values[1]), "graph");
+        }
+        other => panic!("Expected ListValue for tags, got {other:?}"),
+    }
+
+    // Verify embedding array
+    let emb_val = &r.rows[0].values[1];
+    match emb_val.value.as_ref().unwrap() {
+        proto::graph_value::Value::ListValue(list) => {
+            assert_eq!(list.values.len(), 3, "Expected 3 embedding values");
+        }
+        other => panic!("Expected ListValue for embedding, got {other:?}"),
+    }
+}
+
+/// Regression: proto_params_to_json() used to drop ListValue to Null.
+/// Same bug but tested via HTTP protobuf path.
+#[tokio::test]
+async fn test_regression_http_proto_array_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let urls = start_server(dir.path(), Arc::new(TokenStore::open())).await;
+    let client = http_client();
+
+    // Create table
+    client
+        .post(format!("{}/v1/execute", urls.http))
+        .json(&json!({"query": "CREATE NODE TABLE HttpArr(id INT64, tags STRING[], PRIMARY KEY(id))"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert with array param via HTTP protobuf
+    let tags_param = proto::MapEntry {
+        key: "tags".into(),
+        value: Some(proto::GraphValue {
+            value: Some(proto::graph_value::Value::ListValue(proto::ListValue {
+                values: vec![
+                    proto::GraphValue { value: Some(proto::graph_value::Value::StringValue("a".into())) },
+                    proto::GraphValue { value: Some(proto::graph_value::Value::StringValue("b".into())) },
+                ],
+            })),
+        }),
+    };
+    let resp = client
+        .post(format!("{}/v1/execute", urls.http))
+        .header("content-type", "application/x-protobuf")
+        .body(proto_execute_bytes(
+            "CREATE (:HttpArr {id: 1, tags: $tags})",
+            vec![tags_param],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.bytes().await.unwrap();
+    let msg = decode_proto_resp(&bytes);
+    expect_result(&msg); // Must succeed
+
+    // Query back via JSON and verify
+    let rows = query_rows(&urls.http, "MATCH (n:HttpArr) RETURN n.tags").await;
+    assert_eq!(rows.len(), 1);
+    let tags = rows[0][0].as_array().unwrap();
+    assert_eq!(tags.len(), 2);
+    assert_eq!(tags[0].as_str().unwrap(), "a");
+    assert_eq!(tags[1].as_str().unwrap(), "b");
+}
+
+/// Regression: json_value_to_graph_value() lost arrays and json_to_lbug rejected them.
+/// Array params sent via HTTP JSON must survive journal roundtrip + restore.
+#[tokio::test]
+async fn test_regression_journal_array_params_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = start_snapshot_server(dir.path()).await;
+    let client = http_client();
+
+    // Create table with array column
+    client
+        .post(format!("{}/v1/execute", ctx.http))
+        .json(&json!({"query": "CREATE NODE TABLE JnlRegArr(id INT64, vec DOUBLE[], PRIMARY KEY(id))"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Take snapshot (captures DDL)
+    client
+        .post(format!("{}/v1/snapshot", ctx.http))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert with array params AFTER snapshot (so it's journal-only)
+    let resp = client
+        .post(format!("{}/v1/execute", ctx.http))
+        .json(&json!({
+            "query": "CREATE (:JnlRegArr {id: $id, vec: $vec})",
+            "params": {"id": 1, "vec": [0.1, 0.2, 0.3, 0.4, 0.5]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "result");
+
+    flush_journal(&ctx.journal_tx);
+
+    // Restore: snapshot + journal replay (journal entry has array params)
+    let restore_dir = tempfile::tempdir().unwrap();
+    let restore_data = restore_dir.path();
+    std::fs::create_dir_all(restore_data).unwrap();
+    copy_dir_all(&ctx.data_dir.join("snapshots"), &restore_data.join("snapshots"));
+    copy_dir_all(&ctx.data_dir.join("journal"), &restore_data.join("journal"));
+
+    graphd::snapshot::restore(restore_data, None).unwrap();
+
+    // Verify array survived journal roundtrip
+    let verify_http = start_verify_server(restore_data).await;
+    let rows = query_rows(&verify_http, "MATCH (n:JnlRegArr) RETURN n.id, n.vec").await;
+    assert_eq!(rows.len(), 1, "Row with array params must survive journal restore");
+    assert_eq!(rows[0][0].as_i64().unwrap(), 1);
+    let vec: Vec<f64> = rows[0][1]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert_eq!(vec.len(), 5);
+    assert!((vec[0] - 0.1).abs() < 1e-6);
+    assert!((vec[4] - 0.5).abs() < 1e-6);
+}
+
+/// Regression: proto_params_to_json() dropped arrays, which also broke journal
+/// for WS clients. This test sends array params via WS, then verifies the
+/// journal entry has the arrays intact.
+#[tokio::test]
+async fn test_regression_ws_array_params_journaled() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = start_server_with_journal(dir.path()).await;
+    let mut ws = connect(&ctx.ws).await;
+
+    send(&mut ws, hello(None)).await;
+    let _ = recv(&mut ws).await;
+
+    // Create table
+    send(
+        &mut ws,
+        execute("CREATE NODE TABLE WsJnl(id INT64, tags STRING[], PRIMARY KEY(id))"),
+    )
+    .await;
+    let _ = recv(&mut ws).await;
+
+    // Insert with array params via WS protobuf
+    let tags = proto::MapEntry {
+        key: "tags".into(),
+        value: Some(proto::GraphValue {
+            value: Some(proto::graph_value::Value::ListValue(proto::ListValue {
+                values: vec![
+                    proto::GraphValue { value: Some(proto::graph_value::Value::StringValue("x".into())) },
+                    proto::GraphValue { value: Some(proto::graph_value::Value::StringValue("y".into())) },
+                ],
+            })),
+        }),
+    };
+    send(
+        &mut ws,
+        execute_full(
+            "CREATE (:WsJnl {id: $id, tags: $tags})",
+            vec![int_param("id", 1), tags],
+            None,
+            None,
+        ),
+    )
+    .await;
+    let resp = recv(&mut ws).await;
+    expect_result(&resp);
+
+    // Flush and read journal
+    flush_journal(&ctx.journal_tx);
+    let entries = read_journal_entries(&ctx.journal_dir);
+
+    // Find the INSERT entry (skip DDL)
+    let insert_entry = entries
+        .iter()
+        .find(|e| e.entry.query.contains("WsJnl {id:"))
+        .expect("INSERT must be in journal");
+
+    // Verify tags param survived as array in the journal (not null)
+    let params = graphd::journal::map_entries_to_json(&insert_entry.entry.params).unwrap();
+    let tags_json = &params["tags"];
+    assert!(tags_json.is_array(), "tags must be array in journal, got: {tags_json}");
+    let arr = tags_json.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0].as_str().unwrap(), "x");
+    assert_eq!(arr[1].as_str().unwrap(), "y");
 }

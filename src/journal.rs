@@ -49,12 +49,27 @@ fn json_value_to_graph_value(v: &serde_json::Value) -> proto::GraphValue {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Value::IntValue(i)
+            } else if let Some(u) = n.as_u64() {
+                // u64 > i64::MAX can't fit in proto int64. Store as string to
+                // preserve the exact value; lbug will cast on restore if needed.
+                Value::StringValue(u.to_string())
             } else {
                 Value::FloatValue(n.as_f64().unwrap_or(0.0))
             }
         }
         serde_json::Value::String(s) => Value::StringValue(s.clone()),
-        _ => Value::NullValue(proto::NullValue {}),
+        serde_json::Value::Array(arr) => Value::ListValue(proto::ListValue {
+            values: arr.iter().map(json_value_to_graph_value).collect(),
+        }),
+        serde_json::Value::Object(map) => Value::MapValue(proto::MapValue {
+            entries: map
+                .iter()
+                .map(|(k, v)| proto::MapEntry {
+                    key: k.clone(),
+                    value: Some(json_value_to_graph_value(v)),
+                })
+                .collect(),
+        }),
     };
     proto::GraphValue { value: Some(value) }
 }
@@ -72,22 +87,34 @@ pub fn json_to_map_entries(params: &Option<serde_json::Value>) -> Vec<proto::Map
     }
 }
 
+fn graph_value_to_json(gv: &proto::GraphValue) -> serde_json::Value {
+    match gv.value.as_ref() {
+        Some(proto::graph_value::Value::NullValue(_)) | None => serde_json::Value::Null,
+        Some(proto::graph_value::Value::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(proto::graph_value::Value::IntValue(i)) => serde_json::json!(*i),
+        Some(proto::graph_value::Value::FloatValue(f)) => serde_json::json!(*f),
+        Some(proto::graph_value::Value::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(proto::graph_value::Value::ListValue(list)) => {
+            serde_json::Value::Array(list.values.iter().map(graph_value_to_json).collect())
+        }
+        Some(proto::graph_value::Value::MapValue(map)) => {
+            let mut obj = serde_json::Map::new();
+            for entry in &map.entries {
+                obj.insert(entry.key.clone(), entry.value.as_ref().map_or(serde_json::Value::Null, graph_value_to_json));
+            }
+            serde_json::Value::Object(obj)
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
 pub fn map_entries_to_json(entries: &[proto::MapEntry]) -> Option<serde_json::Value> {
     if entries.is_empty() {
         return None;
     }
     let mut map = serde_json::Map::new();
     for entry in entries {
-        let value = match entry.value.as_ref().and_then(|v| v.value.as_ref()) {
-            Some(proto::graph_value::Value::NullValue(_)) | None => serde_json::Value::Null,
-            Some(proto::graph_value::Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-            Some(proto::graph_value::Value::IntValue(i)) => serde_json::json!(*i),
-            Some(proto::graph_value::Value::FloatValue(f)) => serde_json::json!(*f),
-            Some(proto::graph_value::Value::StringValue(s)) => {
-                serde_json::Value::String(s.clone())
-            }
-            _ => serde_json::Value::Null,
-        };
+        let value = entry.value.as_ref().map_or(serde_json::Value::Null, graph_value_to_json);
         map.insert(entry.key.clone(), value);
     }
     Some(serde_json::Value::Object(map))
@@ -1053,6 +1080,38 @@ mod tests {
             assert_eq!(e.sequence, i as u64 + 1);
             assert_eq!(e.entry.query, format!("q{}", i + 1));
         }
+    }
+
+    #[test]
+    fn test_param_array_roundtrip() {
+        let original = serde_json::json!({
+            "tags": ["a", "b", "c"],
+            "embedding": [0.1, 0.2, 0.3],
+            "ids": [1, 2, 3]
+        });
+        let entries = json_to_map_entries(&Some(original.clone()));
+        let back = map_entries_to_json(&entries).unwrap();
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn test_param_nested_array_roundtrip() {
+        let original = serde_json::json!({
+            "matrix": [[1, 2], [3, 4]]
+        });
+        let entries = json_to_map_entries(&Some(original.clone()));
+        let back = map_entries_to_json(&entries).unwrap();
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn test_param_map_roundtrip() {
+        let original = serde_json::json!({
+            "attrs": {"color": "red", "count": 5}
+        });
+        let entries = json_to_map_entries(&Some(original.clone()));
+        let back = map_entries_to_json(&entries).unwrap();
+        assert_eq!(original, back);
     }
 
     #[test]

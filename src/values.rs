@@ -155,6 +155,19 @@ pub fn from_lbug_value(value: &lbug::Value) -> GraphValue {
     }
 }
 
+/// Infer the logical type from a lbug Value (for list element type).
+fn lbug_value_logical_type(v: &lbug::Value) -> lbug::LogicalType {
+    match v {
+        lbug::Value::Bool(_) => lbug::LogicalType::Bool,
+        lbug::Value::Int64(_) => lbug::LogicalType::Int64,
+        lbug::Value::UInt64(_) => lbug::LogicalType::UInt64,
+        lbug::Value::Double(_) => lbug::LogicalType::Double,
+        lbug::Value::Float(_) => lbug::LogicalType::Float,
+        lbug::Value::String(_) => lbug::LogicalType::String,
+        _ => lbug::LogicalType::Any,
+    }
+}
+
 /// Convert a JSON value to a LadybugDB value for parameter binding.
 pub fn to_lbug_value(json: &serde_json::Value) -> Result<lbug::Value, String> {
     match json {
@@ -172,8 +185,16 @@ pub fn to_lbug_value(json: &serde_json::Value) -> Result<lbug::Value, String> {
             }
         }
         serde_json::Value::String(s) => Ok(lbug::Value::String(s.clone())),
-        serde_json::Value::Array(_) => {
-            Err("Arrays not supported as query parameters".into())
+        serde_json::Value::Array(arr) => {
+            let items: Result<Vec<lbug::Value>, String> =
+                arr.iter().map(to_lbug_value).collect();
+            let items = items?;
+            // Infer element type from first item, default to Any for empty lists.
+            let elem_type = items
+                .first()
+                .map(lbug_value_logical_type)
+                .unwrap_or(lbug::LogicalType::Any);
+            Ok(lbug::Value::List(elem_type, items))
         }
         serde_json::Value::Object(_) => {
             Err("Objects not supported as query parameters".into())
@@ -291,8 +312,47 @@ mod tests {
     }
 
     #[test]
-    fn test_to_lbug_array_error() {
-        assert!(to_lbug_value(&serde_json::json!([1, 2])).is_err());
+    fn test_to_lbug_array() {
+        match to_lbug_value(&serde_json::json!([1, 2, 3])).unwrap() {
+            lbug::Value::List(ty, items) => {
+                assert_eq!(ty, lbug::LogicalType::Int64);
+                assert_eq!(items.len(), 3);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_to_lbug_float_array() {
+        match to_lbug_value(&serde_json::json!([0.1, 0.2, 0.3])).unwrap() {
+            lbug::Value::List(ty, items) => {
+                assert_eq!(ty, lbug::LogicalType::Double);
+                assert_eq!(items.len(), 3);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_to_lbug_string_array() {
+        match to_lbug_value(&serde_json::json!(["a", "b"])).unwrap() {
+            lbug::Value::List(ty, items) => {
+                assert_eq!(ty, lbug::LogicalType::String);
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_to_lbug_empty_array() {
+        match to_lbug_value(&serde_json::json!([])).unwrap() {
+            lbug::Value::List(ty, items) => {
+                assert_eq!(ty, lbug::LogicalType::Any);
+                assert!(items.is_empty());
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
     }
 
     #[test]

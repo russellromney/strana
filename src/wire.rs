@@ -68,22 +68,44 @@ fn proto_to_client_message(msg: proto::ClientMessage) -> Result<protocol::Client
     }
 }
 
+fn proto_graph_value_to_json(gv: &proto::GraphValue) -> serde_json::Value {
+    match gv.value.as_ref() {
+        Some(proto::graph_value::Value::NullValue(_)) | None => serde_json::Value::Null,
+        Some(proto::graph_value::Value::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(proto::graph_value::Value::IntValue(i)) => serde_json::json!(*i),
+        Some(proto::graph_value::Value::FloatValue(f)) => serde_json::json!(*f),
+        Some(proto::graph_value::Value::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(proto::graph_value::Value::ListValue(list)) => {
+            serde_json::Value::Array(list.values.iter().map(proto_graph_value_to_json).collect())
+        }
+        Some(proto::graph_value::Value::MapValue(map)) => {
+            let mut obj = serde_json::Map::new();
+            for entry in &map.entries {
+                obj.insert(
+                    entry.key.clone(),
+                    entry
+                        .value
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, proto_graph_value_to_json),
+                );
+            }
+            serde_json::Value::Object(obj)
+        }
+        // Node/Rel/Path/Union are result types, not valid as params.
+        _ => serde_json::Value::Null,
+    }
+}
+
 fn proto_params_to_json(params: &[proto::MapEntry]) -> Option<serde_json::Value> {
     if params.is_empty() {
         return None;
     }
     let mut map = serde_json::Map::new();
     for entry in params {
-        let value = match entry.value.as_ref().and_then(|v| v.value.as_ref()) {
-            Some(proto::graph_value::Value::NullValue(_)) | None => serde_json::Value::Null,
-            Some(proto::graph_value::Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-            Some(proto::graph_value::Value::IntValue(i)) => serde_json::json!(*i),
-            Some(proto::graph_value::Value::FloatValue(f)) => serde_json::json!(*f),
-            Some(proto::graph_value::Value::StringValue(s)) => {
-                serde_json::Value::String(s.clone())
-            }
-            _ => serde_json::Value::Null,
-        };
+        let value = entry
+            .value
+            .as_ref()
+            .map_or(serde_json::Value::Null, proto_graph_value_to_json);
         map.insert(entry.key.clone(), value);
     }
     Some(serde_json::Value::Object(map))
@@ -727,6 +749,100 @@ mod tests {
         assert!((obj["f"].as_f64().unwrap() - 3.14).abs() < 0.001);
         assert_eq!(obj["b"], true);
         assert!(obj["n"].is_null());
+    }
+
+    #[test]
+    fn test_params_list_value() {
+        let params = vec![proto::MapEntry {
+            key: "embedding".into(),
+            value: Some(proto::GraphValue {
+                value: Some(proto::graph_value::Value::ListValue(proto::ListValue {
+                    values: vec![
+                        proto::GraphValue {
+                            value: Some(proto::graph_value::Value::FloatValue(0.1)),
+                        },
+                        proto::GraphValue {
+                            value: Some(proto::graph_value::Value::FloatValue(0.2)),
+                        },
+                        proto::GraphValue {
+                            value: Some(proto::graph_value::Value::FloatValue(0.3)),
+                        },
+                    ],
+                })),
+            }),
+        }];
+        let json = proto_params_to_json(&params).unwrap();
+        let arr = json["embedding"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert!((arr[0].as_f64().unwrap() - 0.1).abs() < 0.001);
+        assert!((arr[1].as_f64().unwrap() - 0.2).abs() < 0.001);
+        assert!((arr[2].as_f64().unwrap() - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_params_map_value() {
+        let params = vec![proto::MapEntry {
+            key: "attrs".into(),
+            value: Some(proto::GraphValue {
+                value: Some(proto::graph_value::Value::MapValue(proto::MapValue {
+                    entries: vec![
+                        proto::MapEntry {
+                            key: "color".into(),
+                            value: Some(proto::GraphValue {
+                                value: Some(proto::graph_value::Value::StringValue("red".into())),
+                            }),
+                        },
+                        proto::MapEntry {
+                            key: "count".into(),
+                            value: Some(proto::GraphValue {
+                                value: Some(proto::graph_value::Value::IntValue(5)),
+                            }),
+                        },
+                    ],
+                })),
+            }),
+        }];
+        let json = proto_params_to_json(&params).unwrap();
+        let obj = json["attrs"].as_object().unwrap();
+        assert_eq!(obj["color"], "red");
+        assert_eq!(obj["count"], 5);
+    }
+
+    #[test]
+    fn test_params_nested_list() {
+        // List of lists (e.g. batch of embeddings)
+        let inner1 = proto::GraphValue {
+            value: Some(proto::graph_value::Value::ListValue(proto::ListValue {
+                values: vec![
+                    proto::GraphValue {
+                        value: Some(proto::graph_value::Value::IntValue(1)),
+                    },
+                    proto::GraphValue {
+                        value: Some(proto::graph_value::Value::IntValue(2)),
+                    },
+                ],
+            })),
+        };
+        let inner2 = proto::GraphValue {
+            value: Some(proto::graph_value::Value::ListValue(proto::ListValue {
+                values: vec![proto::GraphValue {
+                    value: Some(proto::graph_value::Value::IntValue(3)),
+                }],
+            })),
+        };
+        let params = vec![proto::MapEntry {
+            key: "batch".into(),
+            value: Some(proto::GraphValue {
+                value: Some(proto::graph_value::Value::ListValue(proto::ListValue {
+                    values: vec![inner1, inner2],
+                })),
+            }),
+        }];
+        let json = proto_params_to_json(&params).unwrap();
+        let outer = json["batch"].as_array().unwrap();
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer[0].as_array().unwrap().len(), 2);
+        assert_eq!(outer[1].as_array().unwrap().len(), 1);
     }
 
     #[test]
