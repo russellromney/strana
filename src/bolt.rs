@@ -344,14 +344,16 @@ fn handle_bolt_message<'db>(
                             info!("Bolt: authenticated (label={label})");
                         }
                         Err(_) => {
-                            return failure_message(
+                            return failure_message_versioned(
+                                bolt_version,
                                 "Neo.ClientError.Security.Unauthorized",
                                 "Invalid credentials",
                             );
                         }
                     },
                     None => {
-                        return failure_message(
+                        return failure_message_versioned(
+                            bolt_version,
                             "Neo.ClientError.Security.Unauthorized",
                             "Authentication required: provide credentials in HELLO",
                         );
@@ -648,14 +650,16 @@ fn handle_bolt_message<'db>(
                             info!("Bolt 5.x: authenticated (label={label})");
                         }
                         Err(_) => {
-                            return failure_message(
+                            return failure_message_versioned(
+                                bolt_version,
                                 "Neo.ClientError.Security.Unauthorized",
                                 "Invalid credentials",
                             );
                         }
                     },
                     None => {
-                        return failure_message(
+                        return failure_message_versioned(
+                            bolt_version,
                             "Neo.ClientError.Security.Unauthorized",
                             "Authentication required: provide credentials in LOGON",
                         );
@@ -714,17 +718,70 @@ fn success_message(metadata: HashMap<String, Value>) -> Vec<Bytes> {
     })
 }
 
-/// Create a FAILURE response message as chunked bytes.
+/// Create a FAILURE response message as chunked bytes (legacy, pre-5.7).
 fn failure_message(code: &str, message: &str) -> Vec<Bytes> {
+    failure_message_versioned(BoltVersion::V4_4, code, message)
+}
+
+/// Create a version-aware FAILURE response message as chunked bytes.
+///
+/// **Bolt 4.4-5.6:**
+/// - Returns `code` (Neo4j error code) and `message` fields
+///
+/// **Bolt 5.7+:**
+/// - Returns `neo4j_code` (replaces `code`)
+/// - Returns `gql_status` (GQL standard status identifier)
+/// - Returns `description` (human-readable description)
+/// - Can include `diagnostic_record` for additional context
+fn failure_message_versioned(bolt_version: BoltVersion, code: &str, message: &str) -> Vec<Bytes> {
     let mut metadata = HashMap::new();
-    metadata.insert("code".to_string(), Value::from(code));
-    metadata.insert("message".to_string(), Value::from(message));
+
+    match bolt_version {
+        BoltVersion::V5(minor) if minor >= 7 => {
+            // Bolt 5.7+: GQL-compliant error reporting
+            metadata.insert("neo4j_code".to_string(), Value::from(code));
+            metadata.insert("description".to_string(), Value::from(message));
+
+            // Map Neo4j error codes to GQL status codes
+            // For now, use a simplified mapping - full mapping would be extensive
+            let gql_status = map_neo4j_to_gql_status(code);
+            metadata.insert("gql_status".to_string(), Value::from(gql_status));
+
+            // Diagnostic record could include additional context
+            // For now, keep it minimal
+            let mut diagnostic = HashMap::new();
+            diagnostic.insert("_severity".to_string(), Value::from("ERROR"));
+            metadata.insert("diagnostic_record".to_string(), Value::from(diagnostic));
+        }
+        _ => {
+            // Bolt 4.4-5.6: Legacy error reporting
+            metadata.insert("code".to_string(), Value::from(code));
+            metadata.insert("message".to_string(), Value::from(message));
+        }
+    }
+
     let failure = Failure::new(metadata);
     let msg = Message::Failure(failure);
     msg.into_chunks().unwrap_or_else(|e| {
         error!("Failed to serialize FAILURE: {e}");
         Vec::new()
     })
+}
+
+/// Map Neo4j error codes to GQL status codes (simplified).
+///
+/// Full mapping: https://neo4j.com/docs/status-codes/current/
+fn map_neo4j_to_gql_status(neo4j_code: &str) -> &'static str {
+    match neo4j_code {
+        code if code.starts_with("Neo.ClientError.Security") => "42000", // Syntax error or access rule violation
+        code if code.starts_with("Neo.ClientError.Statement") => "42000", // Syntax error or access rule violation
+        code if code.starts_with("Neo.ClientError.Schema") => "42000", // Syntax error or access rule violation
+        code if code.starts_with("Neo.ClientError.Request") => "42000", // Syntax error or access rule violation
+        code if code.starts_with("Neo.ClientError") => "22000", // Data exception
+        code if code.starts_with("Neo.TransientError") => "40000", // Transaction rollback
+        code if code.starts_with("Neo.DatabaseError") => "HZ000", // Remote database access
+        _ => "HZ000", // General error - Remote database access
+    }
 }
 
 // ─── Value conversion ───
