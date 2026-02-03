@@ -1,10 +1,8 @@
 # Strana Roadmap
 
-Strategic direction: graphd is a graph database server for AI memory tools (Mem0, Graphiti, Cognee). Powered by LadybugDB (a Kuzu fork) with Cypher, vector HNSW, full-text search, and MERGE. Speaks Bolt protocol so neo4j-driver clients connect directly.
+Strategic direction: graphd is an open-source graph database server for AI memory tools (Mem0, Graphiti, Cognee). Powered by LadybugDB (a Kuzu fork) with Cypher, vector HNSW, full-text search, and MERGE. Speaks Bolt protocol so neo4j-driver clients connect directly.
 
 Key insight: Mem0 and Graphiti both already have Kuzu backends that emit compatible Cypher. We fork those backends to use neo4j-driver over Bolt pointing at graphd. No query translation — LadybugDB IS Kuzu.
-
-Cloud-first: Cinch hosts graphd as a managed service. Open source later.
 
 ## Phase 8-hardening: Production Hardening
 
@@ -731,7 +729,7 @@ Production features to build on top of bolt-rs primitives:
 - Wrap TCP acceptor with tokio-rustls before handing to bolt-rs
 - Accept both plain (`bolt://`) and TLS (`bolt+s://`)
 - `--bolt-tls-cert` and `--bolt-tls-key` flags for PEM cert/key
-- In Cinch cloud, TLS termination happens at the proxy layer
+- In cloud deployments, TLS termination can happen at the proxy layer
 
 **Config:** `--bolt-port 7687`, `--bolt-listen 0.0.0.0`, `--bolt-tls-cert`, `--bolt-tls-key`
 
@@ -776,11 +774,129 @@ Carry forward from existing graphd:
 - Neo4j Python driver integration: `from neo4j import GraphDatabase; driver.execute_query("MATCH ...")`
 - DDL over Bolt: CREATE NODE TABLE, CREATE REL TABLE
 
-## Phase 9: Mem0 Integration
+## Phase 9: GraphJ Replication Integration Tests
+
+Comprehensive test suite proving logical replication works correctly across crash recovery, schema evolution, compression, encryption, and S3 operations.
+
+**Goal:** High confidence that journal replay produces bit-identical database state. Critical for backup/restore, point-in-time recovery, and future read replicas.
+
+### 9a. Determinism verification
+
+**Core principle:** Same journal sequence → same final state, every time.
+
+Verify that replaying a journal to an empty database produces bit-identical state to the original. Run identical workloads, compare resulting database files byte-for-byte. Test with multiple replay runs to ensure no hidden non-determinism.
+
+Key scenarios:
+- Replay produces identical database state (file-level comparison)
+- Parameter ordering doesn't affect journal entries
+- Concurrent writes serialize deterministically
+- Repeated replays from same journal yield identical results
+
+### 9b. Crash recovery
+
+Verify journal recovers correct state after process crashes at various points in the write/commit cycle.
+
+Kill graphd during operations and verify recovery on restart:
+- Unsealed segment with partial writes recovers all committed data
+- Uncommitted transactions disappear on crash (ACID durability)
+- Fsync boundaries are honored (data not fsynced = data lost)
+- Partial journal entries are detected and skipped safely
+- Segment rotation mid-crash leaves consistent sealed/unsealed pair
+
+### 9c. Schema evolution
+
+Verify DDL operations (CREATE/DROP/ALTER TABLE) replay in correct order and produce correct final schema.
+
+Test schema changes interleaved with data operations:
+- Table creation followed by inserts replays correctly
+- Relationship tables with foreign key constraints enforce referential integrity on replay
+- DROP TABLE removes old data, subsequent CREATE with same name starts fresh
+- Column additions (ALTER) preserve existing data, new columns appear
+- Indexes rebuild correctly on replay
+
+### 9d. Compression & encryption
+
+Verify sealed segments with compression and/or encryption replay correctly and detect tampering.
+
+Test compaction with various protection levels:
+- Zstd-compressed segments decompress and replay correctly
+- Encrypted segments decrypt with correct key, fail without key
+- Header tampering (AAD) detected by AEAD verification
+- Body tampering detected by checksums or decryption failure
+- Multiple compression levels produce valid segments (size varies, data identical)
+
+### 9e. S3 backup/restore
+
+Verify complete snapshot → S3 → restore workflow preserves data correctly.
+
+Test end-to-end S3 operations:
+- Snapshot uploads to S3 with correct naming and metadata
+- Restore from S3 downloads and unpacks correctly, all data present
+- Incremental snapshots represent point-in-time state accurately
+- Compacted journal segments restore without raw segments
+- Retention policies delete old snapshots, keep recent ones
+
+Uses Tigris for testing (S3-compatible, no Docker).
+
+### 9f. Point-in-time recovery
+
+Verify ability to restore database to any historical sequence number.
+
+Test partial replay scenarios:
+- Replay stops at specified sequence, database contains only writes up to that point
+- Multi-segment replay stops mid-segment correctly
+- Snapshot + partial journal replay combines correctly (base state + incremental)
+
+### 9g. Corruption detection
+
+Verify all integrity checks (CRC32C, SHA-256 chain, body checksum, AEAD) detect tampering.
+
+Test various corruption scenarios:
+- Entry-level corruption detected by CRC32C, bad entries skipped safely
+- Chain hash mismatches detected, segment rejected
+- Sealed segment body checksum mismatches abort replay
+- AEAD authentication detects header tampering
+- Magic byte corruption triggers legacy fallback or rejection
+
+### 9h. Large-scale stress
+
+Verify replication scales to production workloads without performance or memory issues.
+
+Test realistic scale:
+- 100K+ nodes and relationships replay correctly
+- Deep graph structures (1000+ hop paths) maintain integrity
+- Concurrent reads work against partially-replayed state
+- Memory-bounded replay doesn't OOM, uses streaming correctly
+
+### 9i. Non-determinism regression
+
+Verify query rewriter catches all non-deterministic functions before they reach the journal.
+
+Test function rewriting:
+- Timestamp functions replaced with constants in journal
+- UUID generation produces same IDs on replay
+- Random values deterministic on replay
+- Unsupported non-deterministic functions rejected with error (not silently logged)
+
+### Tests summary
+
+**Total: ~40-50 integration tests organized into 9 test modules.**
+
+Run all:
+```bash
+make test-graphj          # All GraphJ tests
+make test-graphj-quick    # Skip slow stress tests
+```
+
+### Acceptance criteria
+
+All tests pass before merging any GraphJ-dependent feature (Mem0, Graphiti, cloud deployments). CI runs full suite on every PR.
+
+## Phase 10: Mem0 Integration
 
 Fork Mem0's Kuzu backend (`mem0/memory/kuzu_memory.py`), replace `kuzu` SDK with `neo4j` driver over Bolt. Same Cypher, remote transport.
 
-### 9a. Parameterized queries via bolt-rs
+### 10a. Parameterized queries via bolt-rs
 
 Mem0 passes parameters for every query. graphd's Bolt server must map Bolt parameter dictionaries to LadybugDB PreparedStatement API.
 
@@ -790,7 +906,7 @@ Mem0 passes parameters for every query. graphd's Bolt server must map Bolt param
 - Pass converted parameters to `connection.prepare(query).execute(params)`
 - For FLOAT[] parameters (embeddings), Mem0 sends Python lists of floats — these arrive as BoltList of BoltFloat, convert to lbug's list-of-float type
 
-### 9b. INTERNAL_ID serialization
+### 10b. INTERNAL_ID serialization
 
 Mem0's Kuzu backend uses `id(node)` to get node IDs, then passes them back via `internal_id($table, $offset)` for lookups.
 
@@ -799,7 +915,7 @@ Mem0's Kuzu backend uses `id(node)` to get node IDs, then passes them back via `
 - On the Python side, `result["id"]` will be a dict `{"table": 0, "offset": 5}` — matching what kuzu SDK returns
 - The graphd backend can use `result["id"]["table"]` and `result["id"]["offset"]` with zero changes from the Kuzu backend's access pattern
 
-### 9c. Remaining Arrow type mappings
+### 10c. Remaining Arrow type mappings
 
 Mem0 queries return types beyond Bool/Int64/Float64/Utf8:
 
@@ -809,7 +925,7 @@ Mem0 queries return types beyond Bool/Int64/Float64/Utf8:
 - STRUCT (general) → Value::Map
 - NULL values in any column → Value::Null (check for nulls before downcasting)
 
-### 9d. graphd backend for Mem0
+### 10d. graphd backend for Mem0
 
 New file: `mem0/memory/graphd_memory.py`. Fork of `kuzu_memory.py` with transport swap.
 
@@ -841,7 +957,7 @@ New file: `mem0/memory/graphd_memory.py`. Fork of `kuzu_memory.py` with transpor
 - Add `"graphd": "mem0.memory.graphd_memory.MemoryGraph"` to factory in `mem0/utils/factory.py`
 - Add config validation for provider="graphd"
 
-### 9e. End-to-end test
+### 10e. End-to-end test
 
 - Start graphd locally (bolt-rs server with lbug)
 - Configure Mem0: `graph_store: {provider: "graphd", config: {url: "bolt://localhost:7687"}}`
@@ -863,7 +979,7 @@ New file: `mem0/memory/graphd_memory.py`. Fork of `kuzu_memory.py` with transpor
 - Mem0 add/search/get_all/delete_all/reset against graphd
 - Vector similarity: `array_cosine_similarity()` with CAST'd float arrays returns correct ordering
 
-## Phase 10: Graphiti Integration
+## Phase 11: Graphiti Integration
 
 Same approach as Mem0. Fork Graphiti's Kuzu backend, swap kuzu SDK for neo4j-driver.
 
@@ -878,26 +994,107 @@ Same approach as Mem0. Fork Graphiti's Kuzu backend, swap kuzu SDK for neo4j-dri
 - `QUERY_FTS_INDEX` for full-text search
 - `CAST()`, `list_concat()`
 
-## Phase 11: Cinch Graph Engine
+## Phase 12: Cloud Deployment Reference Architecture
 
-Add graph as a second engine type in cinch-cloud (alongside Redis cache).
+Reference architecture for deploying graphd as a multi-tenant cloud service.
 
-- Per-tenant graphd instance (same model as per-tenant Redis)
-- Bolt proxy: route by auth token → tenant DB
-- TLS termination at proxy
-- S3 snapshots for graph data (tar+zstd)
-- Dashboard: create/delete graph databases, view schema, run queries
-- Pricing: per-tenant, metered by storage + query volume
+- Per-tenant graphd instances with resource isolation
+- Bolt proxy: route connections by auth token to tenant databases
+- TLS termination at proxy layer
+- S3 snapshots for graph data (tar+zstd compression)
+- Management API: create/delete databases, view schema, execute queries
+- Monitoring: per-tenant metrics (storage, query volume, connection count)
+
+## Phase 13: Replica Mode
+
+Enable graphd to run as a read-only replica that polls cloud storage for updates.
+
+**Use case:** Scale reads horizontally. Primary writes to cloud storage (S3/Tigris). Replicas poll for new snapshots and journal segments, replay locally, serve read-only queries over Bolt.
+
+### Configuration
+
+```bash
+graphd --replica \
+  --replica-source s3://bucket/prefix \
+  --replica-poll-interval 5s \
+  --data-dir ./replica-db
+```
+
+Flags:
+- `--replica`: Enable read-only replica mode (disables writes)
+- `--replica-source <url>`: S3 bucket/prefix or local path to poll
+- `--replica-poll-interval <duration>`: How often to check for updates (default: 10s)
+- `--replica-lag-warn <duration>`: Warn if replica falls behind by this much (default: 60s)
+
+### Behavior
+
+**Initial sync:**
+- On startup, download latest snapshot from replica source
+- Extract to local data directory
+- Download all journal segments newer than snapshot
+- Replay journal to catch up to latest sequence
+
+**Continuous polling:**
+- Every poll interval, list objects at replica source
+- Download new journal segments not yet applied
+- Replay segments in sequence order
+- Update local watermark (last applied sequence number)
+- Serve read queries from local replayed state
+
+**Read-only enforcement:**
+- Reject all write operations (CREATE, SET, DELETE, BEGIN TRANSACTION)
+- Allow read operations (MATCH, RETURN)
+- Return error on write: "Neo.ClientError.Request.Invalid: Replica is read-only"
+
+**Lag monitoring:**
+- Track time since last successful poll
+- Track sequence number lag (latest cloud sequence - local sequence)
+- Expose metrics: replica_lag_seconds, replica_last_poll_timestamp, replica_current_sequence
+- Log warning if lag exceeds threshold
+
+**Failure handling:**
+- Network failures: retry with exponential backoff
+- Corrupt segments: skip, log error, continue with next segment
+- Missing segments: fatal error (gap in replication log)
+
+### Storage layout
+
+Replica source must have:
+```
+s3://bucket/prefix/
+  snapshots/
+    snapshot-2024-01-15-120000.tar.zst
+    snapshot-2024-01-15-130000.tar.zst
+  journal/
+    journal-0000000000000000.graphj
+    journal-0000000000001000.graphj
+    journal-0000000000002000.graphj
+```
+
+### Multi-region replicas
+
+Run replicas in multiple regions for low-latency reads:
+- Primary in us-east-1 writes to S3
+- Replica in eu-west-1 polls S3, serves European reads
+- Replica in ap-southeast-1 polls S3, serves Asian reads
+- All replicas eventually consistent (bounded by poll interval + network latency)
+
+### Testing
+
+Integration tests:
+- Primary writes data, replica polls and sees new data
+- Replica rejects write operations
+- Network failure recovery (primary continues writing, replica catches up when network returns)
+- Snapshot rotation (replica downloads new snapshot, replays incremental journal)
+- Lag monitoring and warnings
 
 ## Later
 
-- Open source graphd
 - Embedded SDKs (strana-python via pyo3+maturin, strana-node via koffi FFI)
 - Neo4j Cypher compatibility layer (query rewriter for Neo4j-dialect Cypher)
 - Schema inference (auto-DDL on MERGE into nonexistent table)
-- Embedded replicas (read replicas synced from cloud via S3 snapshots)
 - MCP server (Model Context Protocol) for direct LLM ↔ graph interaction
 - Cognee verification (third AI memory framework)
 - APOC-compatible procedure library (most-used subset)
-- Bolt 5.5+ features (routing, multi-database) if needed for cloud proxy
+- Bolt 5.5+ features (routing, multi-database) if needed for cloud deployments
 - zstd dictionary training for journal compression (5-10% additional compression on Cypher patterns, requires dictionary versioning and distribution)

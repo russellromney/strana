@@ -39,8 +39,10 @@ tar = "0.4"
 zstd = "0.13"
 
 # Bolt protocol
-bolt4rs = { path = "../bolt4rs/lib", features = ["unstable-bolt-protocol-impl-v2", "unstable-serde-packstream-format"] }
+bolt-proto = "0.12.0"
+futures-util = "0.3"
 bytes = "1.0"
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [build-dependencies]
 prost-build = "0.13"
@@ -50,7 +52,6 @@ tempfile = "3"
 reqwest = { version = "0.12", features = ["json"] }
 aws-config = "1"
 aws-sdk-s3 = "1"
-bolt4rs = { path = "../bolt4rs/lib", features = ["unstable-bolt-protocol-impl-v2", "unstable-serde-packstream-format"] }
 criterion = "0.5"
 
 [[bench]]

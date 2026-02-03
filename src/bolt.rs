@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::TokenStore;
@@ -11,10 +12,9 @@ use crate::journal::{self, JournalCommand, JournalSender, PendingEntry};
 use crate::query;
 use crate::values::{self, GraphValue};
 
-use bolt4rs::bolt::response::success;
-use bolt4rs::bolt::summary::{Success, Summary};
-use bolt4rs::messages::{BoltRequest, BoltResponse, Record};
-use bolt4rs::{BoltBoolean, BoltFloat, BoltInteger, BoltList, BoltMap, BoltNull, BoltString, BoltType};
+use bolt_proto::{Message, Value};
+use bolt_proto::message::{Record, Success, Failure};
+use std::collections::HashMap;
 
 const MAX_CHUNK_SIZE: usize = 65_535;
 
@@ -126,40 +126,46 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
     });
 
     // ── Message loop ──
+    let mut compat_stream = stream.compat();
     loop {
-        match read_chunked_message(&mut stream).await {
-            Ok(Some(msg_bytes)) => {
-                let req = match BoltRequest::parse(bolt4rs::Version::V4_4, msg_bytes) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("Invalid Bolt message: {e}");
-                        break;
-                    }
-                };
-
-                if req_tx.send(BoltOp::Request(req)).is_err() {
-                    break; // worker exited
-                }
-
-                // Wait for response(s) from worker.
-                match resp_rx.recv().await {
-                    Some(responses) => {
-                        for response_bytes in responses {
-                            if let Err(e) = send_chunked_message(&mut stream, response_bytes).await
-                            {
-                                debug!("Bolt send error: {e}");
-                                return Ok(());
-                            }
-                        }
-                    }
-                    None => break, // worker exited
-                }
-            }
-            Ok(None) => break,
+        // Parse bolt-rs Message directly from stream (it reads chunks internally)
+        let msg = match Message::from_stream(&mut compat_stream).await {
+            Ok(m) => m,
             Err(e) => {
-                debug!("Bolt read error: {e}");
+                debug!("Bolt read error or client disconnect: {e}");
                 break;
             }
+        };
+
+        debug!("Received Bolt message: {:?}", msg);
+
+        if req_tx.send(BoltOp::Request(msg)).is_err() {
+            break; // worker exited
+        }
+
+        // Wait for response(s) from worker.
+        match resp_rx.recv().await {
+            Some(responses) => {
+                debug!("Sending {} chunks to client", responses.len());
+                // Responses are already chunked by into_chunks(), just write them directly
+                // Need to get back the inner stream for writing
+                let mut inner = compat_stream.into_inner();
+                for (i, chunk) in responses.iter().enumerate() {
+                    debug!("Writing chunk {}: {} bytes", i, chunk.len());
+                    if let Err(e) = inner.write_all(chunk).await {
+                        debug!("Bolt send error: {e}");
+                        return Ok(());
+                    }
+                }
+                if let Err(e) = inner.flush().await {
+                    debug!("Bolt flush error: {e}");
+                    return Ok(());
+                }
+                debug!("Successfully sent all chunks");
+                // Wrap it again for the next iteration
+                compat_stream = inner.compat();
+            }
+            None => break, // worker exited
         }
     }
 
@@ -171,7 +177,7 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
 
 /// Operations sent to the blocking session worker.
 enum BoltOp {
-    Request(BoltRequest),
+    Request(Message),
 }
 
 /// Blocking session worker that owns the database connection.
@@ -208,12 +214,17 @@ fn bolt_session_worker(
     while let Some(BoltOp::Request(req)) = rx.blocking_recv() {
         // Acquire write guard before executing mutations or starting transactions.
         match &req {
-            BoltRequest::Run(run) if !in_transaction && write_guard.is_none() => {
-                if journal::is_mutation(&run.query.to_string()) {
+            Message::Run(run) if !in_transaction && write_guard.is_none() => {
+                if journal::is_mutation(run.query()) {
                     write_guard = Some(engine.acquire_writer());
                 }
             }
-            BoltRequest::Begin(_) if write_guard.is_none() => {
+            Message::RunWithMetadata(run) if !in_transaction && write_guard.is_none() => {
+                if journal::is_mutation(run.statement()) {
+                    write_guard = Some(engine.acquire_writer());
+                }
+            }
+            Message::Begin(_) if write_guard.is_none() => {
                 write_guard = Some(engine.acquire_writer());
             }
             _ => {}
@@ -248,7 +259,7 @@ fn bolt_session_worker(
 /// Handle a single Bolt message, returning response bytes.
 #[allow(deprecated)]
 fn handle_bolt_message<'db>(
-    req: &BoltRequest,
+    req: &Message,
     conn: &lbug::Connection<'db>,
     tokens: &Arc<TokenStore>,
     journal: &Option<JournalSender>,
@@ -262,57 +273,61 @@ fn handle_bolt_message<'db>(
 ) -> Vec<Bytes> {
     match req {
         // ── HELLO ──
-        BoltRequest::Hello(hello) => {
+        Message::Hello(hello) => {
             if tokens.is_empty() {
                 // Open access — no tokens configured.
                 *authenticated = true;
                 info!("Bolt: client connected (open access)");
             } else {
-                // Extract credentials from HELLO extra map.
+                // Extract credentials from HELLO metadata map.
                 // Neo4j drivers send: scheme="basic", principal="neo4j", credentials="<token>"
-                match extract_credentials(hello.extra()) {
+                match extract_credentials(hello.metadata()) {
                     Some(token) => match tokens.validate(token) {
                         Ok(label) => {
                             *authenticated = true;
                             info!("Bolt: authenticated (label={label})");
                         }
                         Err(_) => {
-                            return vec![failure_bytes(
+                            return failure_message(
                                 "Neo.ClientError.Security.Unauthorized",
                                 "Invalid credentials",
-                            )];
+                            );
                         }
                     },
                     None => {
-                        return vec![failure_bytes(
+                        return failure_message(
                             "Neo.ClientError.Security.Unauthorized",
                             "Authentication required: provide credentials in HELLO",
-                        )];
+                        );
                     }
                 }
             }
 
-            let metadata = success::MetaBuilder::new()
-                .server(&format!("Neo4j/5.x.0-graphd-{}", env!("CARGO_PKG_VERSION")))
-                .connection_id("bolt-1")
-                .build();
-            let summary = Summary::Success(Success { metadata });
-            vec![Bytes::from(summary.to_bytes().unwrap_or_default())]
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "server".to_string(),
+                Value::from(format!("Neo4j/5.x.0-graphd-{}", env!("CARGO_PKG_VERSION"))),
+            );
+            metadata.insert("connection_id".to_string(), Value::from("bolt-1"));
+            debug!("Sending HELLO SUCCESS with metadata: {:?}", metadata);
+            let response = success_message(metadata);
+            debug!("HELLO SUCCESS response has {} chunks", response.len());
+            response
         }
 
         // ── RUN ──
-        BoltRequest::Run(run) => {
+        Message::Run(run) => {
             if !*authenticated {
-                return vec![failure_bytes(
+                return failure_message(
                     "Neo.ClientError.Security.AuthenticationRateLimit",
                     "Not authenticated",
-                )];
+                );
             }
 
-            let query_str = run.query.to_string();
+            let query_str = run.query();
 
             // Convert Bolt parameters to JSON for our query engine.
-            let json_params = bolt_params_to_json(&run.parameters);
+            let json_params = bolt_params_to_json(run.parameters());
 
             // Rewrite + execute via shared query engine.
             let _lock = if !*in_transaction {
@@ -321,7 +336,7 @@ fn handle_bolt_message<'db>(
                 None
             };
 
-            match query::run_query_raw(conn, &query_str, json_params.as_ref()) {
+            match query::run_query_raw(conn, query_str, json_params.as_ref()) {
                 Ok(raw) => {
                     // Journal the mutation.
                     if *in_transaction {
@@ -340,30 +355,85 @@ fn handle_bolt_message<'db>(
                     *current_result = Some(raw.query_result);
                     *result_consumed = false;
 
-                    let metadata = success::MetaBuilder::new()
-                        .fields(cols.into_iter())
-                        .build();
-                    let summary = Summary::Success(Success { metadata });
-                    vec![Bytes::from(summary.to_bytes().unwrap_or_default())]
+                    let mut metadata = HashMap::new();
+                    metadata.insert("fields".to_string(), Value::from(cols));
+                    success_message(metadata)
                 }
                 Err(e) => {
-                    vec![failure_bytes(
+                    failure_message(
                         "Neo.DatabaseError.General.UnknownError",
                         &format!("Query error: {e}"),
-                    )]
+                    )
+                }
+            }
+        }
+
+        // ── RUN_WITH_METADATA ──
+        Message::RunWithMetadata(run) => {
+            if !*authenticated {
+                return failure_message(
+                    "Neo.ClientError.Security.AuthenticationRateLimit",
+                    "Not authenticated",
+                );
+            }
+
+            let query_str = run.statement();
+
+            // Convert Bolt parameters to JSON for our query engine.
+            let json_params = bolt_params_to_json(run.parameters());
+
+            // Rewrite + execute via shared query engine.
+            let _lock = if !*in_transaction {
+                Some(snapshot_lock.read().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                None
+            };
+
+            match query::run_query_raw(conn, query_str, json_params.as_ref()) {
+                Ok(raw) => {
+                    // Journal the mutation.
+                    if *in_transaction {
+                        if journal::is_mutation(&raw.rewritten_query) {
+                            tx_journal_buf.push(PendingEntry {
+                                query: raw.rewritten_query.clone(),
+                                params: raw.merged_params.clone(),
+                            });
+                        }
+                    } else {
+                        query::journal_entry(journal, &raw.rewritten_query, &raw.merged_params);
+                    }
+
+                    let cols = raw.columns.clone();
+                    *result_columns = raw.columns;
+                    *current_result = Some(raw.query_result);
+                    *result_consumed = false;
+
+                    let mut metadata = HashMap::new();
+                    metadata.insert("fields".to_string(), Value::from(cols));
+                    success_message(metadata)
+                }
+                Err(e) => {
+                    failure_message(
+                        "Neo.DatabaseError.General.UnknownError",
+                        &format!("Query error: {e}"),
+                    )
                 }
             }
         }
 
         // ── PULL ──
-        BoltRequest::Pull(pull) => {
+        Message::Pull(pull) => {
             if current_result.is_none() || *result_consumed {
-                let metadata = success::MetaBuilder::new().build();
-                let summary = Summary::Success(Success { metadata });
-                return vec![Bytes::from(summary.to_bytes().unwrap_or_default())];
+                return success_message(HashMap::new());
             }
 
-            let max_records = pull.extra.get::<i64>("n").unwrap_or(1000) as usize;
+            let max_records = pull.metadata()
+                .get("n")
+                .and_then(|v| match v {
+                    Value::Integer(i) => Some(*i as usize),
+                    _ => None,
+                })
+                .unwrap_or(1000);
             let result = current_result.as_mut().unwrap();
 
             let mut responses = Vec::new();
@@ -372,16 +442,14 @@ fn handle_bolt_message<'db>(
             while records_sent < max_records {
                 match result.next() {
                     Some(row) => {
-                        let values: Vec<BoltType> = row
+                        let values: Vec<Value> = row
                             .iter()
                             .map(|v| graph_value_to_bolt(&values::from_lbug_value(v)))
                             .collect();
-                        let record = Record {
-                            data: BoltList { value: values },
-                        };
-                        let response = BoltResponse::Record(record);
-                        if let Ok(bytes) = response.to_bytes() {
-                            responses.push(bytes);
+                        let record = Record::new(values);
+                        let msg = Message::Record(record);
+                        if let Ok(chunks) = msg.into_chunks() {
+                            responses.extend(chunks);
                         }
                         records_sent += 1;
                     }
@@ -393,60 +461,54 @@ fn handle_bolt_message<'db>(
             }
 
             let has_more = !*result_consumed;
-            let metadata = success::MetaBuilder::new()
-                .done(!has_more)
-                .has_more(has_more)
-                .build();
-            let summary = Summary::Success(Success { metadata });
-            responses.push(Bytes::from(summary.to_bytes().unwrap_or_default()));
+            let mut metadata = HashMap::new();
+            metadata.insert("has_more".to_string(), Value::from(has_more));
+            let success_chunks = success_message(metadata);
+            responses.extend(success_chunks);
             responses
         }
 
         // ── DISCARD ──
-        BoltRequest::Discard(_) => {
+        Message::Discard(_) => {
             *current_result = None;
             *result_consumed = true;
-            let metadata = success::MetaBuilder::new().build();
-            let summary = Summary::Success(Success { metadata });
-            vec![Bytes::from(summary.to_bytes().unwrap_or_default())]
+            success_message(HashMap::new())
         }
 
         // ── BEGIN ──
-        BoltRequest::Begin(_) => {
+        Message::Begin(_) => {
             if !*authenticated {
-                return vec![failure_bytes(
+                return failure_message(
                     "Neo.ClientError.Security.AuthenticationRateLimit",
                     "Not authenticated",
-                )];
+                );
             }
             if *in_transaction {
-                return vec![failure_bytes(
+                return failure_message(
                     "Neo.ClientError.Transaction.TransactionNotFound",
                     "Transaction already active",
-                )];
+                );
             }
 
             match conn.query("BEGIN TRANSACTION") {
                 Ok(_) => {
                     *in_transaction = true;
-                    let metadata = success::MetaBuilder::new().build();
-                    let summary = Summary::Success(Success { metadata });
-                    vec![Bytes::from(summary.to_bytes().unwrap_or_default())]
+                    success_message(HashMap::new())
                 }
-                Err(e) => vec![failure_bytes(
+                Err(e) => failure_message(
                     "Neo.DatabaseError.General.UnknownError",
                     &format!("BEGIN failed: {e}"),
-                )],
+                ),
             }
         }
 
         // ── COMMIT ──
-        BoltRequest::Commit(_) => {
+        Message::Commit => {
             if !*in_transaction {
-                return vec![failure_bytes(
+                return failure_message(
                     "Neo.ClientError.Transaction.TransactionNotFound",
                     "No active transaction",
-                )];
+                );
             }
 
             let _lock = snapshot_lock.read().unwrap_or_else(|e| e.into_inner());
@@ -460,43 +522,39 @@ fn handle_bolt_message<'db>(
                             }
                         }
                     }
-                    let metadata = success::MetaBuilder::new().build();
-                    let summary = Summary::Success(Success { metadata });
-                    vec![Bytes::from(summary.to_bytes().unwrap_or_default())]
+                    success_message(HashMap::new())
                 }
-                Err(e) => vec![failure_bytes(
+                Err(e) => failure_message(
                     "Neo.DatabaseError.General.UnknownError",
                     &format!("COMMIT failed: {e}"),
-                )],
+                ),
             }
         }
 
         // ── ROLLBACK ──
-        BoltRequest::Rollback(_) => {
+        Message::Rollback => {
             if !*in_transaction {
-                return vec![failure_bytes(
+                return failure_message(
                     "Neo.ClientError.Transaction.TransactionNotFound",
                     "No active transaction",
-                )];
+                );
             }
 
             match conn.query("ROLLBACK") {
                 Ok(_) => {
                     *in_transaction = false;
                     tx_journal_buf.clear();
-                    let metadata = success::MetaBuilder::new().build();
-                    let summary = Summary::Success(Success { metadata });
-                    vec![Bytes::from(summary.to_bytes().unwrap_or_default())]
+                    success_message(HashMap::new())
                 }
-                Err(e) => vec![failure_bytes(
+                Err(e) => failure_message(
                     "Neo.DatabaseError.General.UnknownError",
                     &format!("ROLLBACK failed: {e}"),
-                )],
+                ),
             }
         }
 
         // ── RESET ──
-        BoltRequest::Reset(_) => {
+        Message::Reset => {
             if *in_transaction {
                 let _ = conn.query("ROLLBACK");
                 *in_transaction = false;
@@ -504,69 +562,105 @@ fn handle_bolt_message<'db>(
             }
             *current_result = None;
             *result_consumed = true;
-            let metadata = success::MetaBuilder::new().build();
-            let summary = Summary::Success(Success { metadata });
-            vec![Bytes::from(summary.to_bytes().unwrap_or_default())]
+            success_message(HashMap::new())
+        }
+
+        // ── GOODBYE ──
+        Message::Goodbye => {
+            debug!("Received GOODBYE, closing connection");
+            Vec::new() // No response needed, connection will close
+        }
+
+        // Catch-all for unsupported messages
+        _ => {
+            warn!("Unsupported Bolt message: {:?}", req);
+            failure_message(
+                "Neo.ClientError.Request.Invalid",
+                "Unsupported message type",
+            )
         }
 
     }
+}
+
+// ─── Response helpers ───
+
+/// Create a SUCCESS response message as chunked bytes.
+fn success_message(metadata: HashMap<String, Value>) -> Vec<Bytes> {
+    let success = Success::new(metadata);
+    let msg = Message::Success(success);
+    msg.into_chunks().unwrap_or_else(|e| {
+        error!("Failed to serialize SUCCESS: {e}");
+        Vec::new()
+    })
+}
+
+/// Create a FAILURE response message as chunked bytes.
+fn failure_message(code: &str, message: &str) -> Vec<Bytes> {
+    let mut metadata = HashMap::new();
+    metadata.insert("code".to_string(), Value::from(code));
+    metadata.insert("message".to_string(), Value::from(message));
+    let failure = Failure::new(metadata);
+    let msg = Message::Failure(failure);
+    msg.into_chunks().unwrap_or_else(|e| {
+        error!("Failed to serialize FAILURE: {e}");
+        Vec::new()
+    })
 }
 
 // ─── Value conversion ───
 
-/// Convert Bolt parameters (BoltMap) to JSON for the shared query engine.
-fn bolt_params_to_json(params: &BoltMap) -> Option<serde_json::Value> {
-    if params.value.is_empty() {
+/// Convert Bolt parameters (HashMap<String, Value>) to JSON for the shared query engine.
+fn bolt_params_to_json(params: &HashMap<String, Value>) -> Option<serde_json::Value> {
+    if params.is_empty() {
         return None;
     }
     let mut map = serde_json::Map::new();
-    for (k, v) in &params.value {
-        map.insert(k.value.clone(), bolt_type_to_json(v));
+    for (k, v) in params {
+        map.insert(k.clone(), bolt_value_to_json(v));
     }
     Some(serde_json::Value::Object(map))
 }
 
-/// Convert a BoltType to JSON.
-fn bolt_type_to_json(bolt: &BoltType) -> serde_json::Value {
+/// Convert a bolt-rs Value to JSON.
+fn bolt_value_to_json(bolt: &Value) -> serde_json::Value {
     match bolt {
-        BoltType::String(s) => serde_json::Value::String(s.value.clone()),
-        BoltType::Integer(i) => serde_json::json!(i.value),
-        BoltType::Float(f) => serde_json::json!(f.value),
-        BoltType::Boolean(b) => serde_json::Value::Bool(b.value),
-        BoltType::Null(_) => serde_json::Value::Null,
-        BoltType::List(list) => {
-            serde_json::Value::Array(list.value.iter().map(bolt_type_to_json).collect())
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Integer(i) => serde_json::json!(*i),
+        Value::Float(f) => serde_json::json!(*f),
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::Null => serde_json::Value::Null,
+        Value::List(list) => {
+            serde_json::Value::Array(list.iter().map(bolt_value_to_json).collect())
         }
-        BoltType::Map(map) => {
+        Value::Map(map) => {
             let mut obj = serde_json::Map::new();
-            for (k, v) in &map.value {
-                obj.insert(k.value.clone(), bolt_type_to_json(v));
+            for (k, v) in map {
+                obj.insert(k.clone(), bolt_value_to_json(v));
             }
             serde_json::Value::Object(obj)
         }
-        _ => serde_json::Value::Null, // DateTime etc. — not common as params
+        _ => serde_json::Value::Null, // Bytes, DateTime, Node, Relationship, etc.
     }
 }
 
-/// Convert a GraphValue to BoltType for RECORD responses.
-fn graph_value_to_bolt(gv: &GraphValue) -> BoltType {
+/// Convert a GraphValue to bolt-rs Value for RECORD responses.
+fn graph_value_to_bolt(gv: &GraphValue) -> Value {
     match gv {
-        GraphValue::Null => BoltType::Null(BoltNull {}),
-        GraphValue::Bool(b) => BoltType::Boolean(BoltBoolean { value: *b }),
-        GraphValue::Int(i) => BoltType::Integer(BoltInteger { value: *i }),
-        GraphValue::Float(f) => BoltType::Float(BoltFloat { value: *f }),
-        GraphValue::String(s) => BoltType::String(BoltString {
-            value: s.clone(),
-        }),
-        GraphValue::List(items) => BoltType::List(BoltList {
-            value: items.iter().map(graph_value_to_bolt).collect(),
-        }),
+        GraphValue::Null => Value::Null,
+        GraphValue::Bool(b) => Value::from(*b),
+        GraphValue::Int(i) => Value::from(*i),
+        GraphValue::Float(f) => Value::from(*f),
+        GraphValue::String(s) => Value::from(s.clone()),
+        GraphValue::List(items) => {
+            Value::from(items.iter().map(graph_value_to_bolt).collect::<Vec<_>>())
+        }
         GraphValue::Map(entries) => {
-            let mut map = BoltMap::new();
-            for (k, v) in entries {
-                map.put(BoltString { value: k.clone() }, graph_value_to_bolt(v));
-            }
-            BoltType::Map(map)
+            let map: HashMap<String, Value> = entries
+                .iter()
+                .map(|(k, v)| (k.clone(), graph_value_to_bolt(v)))
+                .collect();
+            Value::from(map)
         }
         GraphValue::Tagged(_tagged) => {
             // Serialize tagged values (Node, Rel, Path) as maps with $type.
@@ -576,48 +670,42 @@ fn graph_value_to_bolt(gv: &GraphValue) -> BoltType {
     }
 }
 
-/// Convert serde_json::Value to BoltType (for tagged value serialization).
-fn json_to_bolt(v: &serde_json::Value) -> BoltType {
+/// Convert serde_json::Value to bolt-rs Value (for tagged value serialization).
+fn json_to_bolt(v: &serde_json::Value) -> Value {
     match v {
-        serde_json::Value::Null => BoltType::Null(BoltNull {}),
-        serde_json::Value::Bool(b) => BoltType::Boolean(BoltBoolean { value: *b }),
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::from(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                BoltType::Integer(BoltInteger { value: i })
+                Value::from(i)
             } else if let Some(f) = n.as_f64() {
-                BoltType::Float(BoltFloat { value: f })
+                Value::from(f)
             } else {
-                BoltType::Null(BoltNull {})
+                Value::Null
             }
         }
-        serde_json::Value::String(s) => BoltType::String(BoltString {
-            value: s.clone(),
-        }),
-        serde_json::Value::Array(arr) => BoltType::List(BoltList {
-            value: arr.iter().map(json_to_bolt).collect(),
-        }),
+        serde_json::Value::String(s) => Value::from(s.clone()),
+        serde_json::Value::Array(arr) => {
+            Value::from(arr.iter().map(json_to_bolt).collect::<Vec<_>>())
+        }
         serde_json::Value::Object(obj) => {
-            let mut map = BoltMap::new();
-            for (k, v) in obj {
-                map.put(BoltString { value: k.clone() }, json_to_bolt(v));
-            }
-            BoltType::Map(map)
+            let map: HashMap<String, Value> = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_bolt(v)))
+                .collect();
+            Value::from(map)
         }
     }
 }
 
 // ─── Bolt auth ───
 
-/// Extract the "credentials" string from a HELLO extra map.
-fn extract_credentials(extra: &BoltMap) -> Option<&str> {
-    extra
-        .value
-        .iter()
-        .find(|(k, _)| k.value == "credentials")
-        .and_then(|(_, v)| match v {
-            BoltType::String(s) => Some(s.value.as_str()),
-            _ => None,
-        })
+/// Extract the "credentials" string from a HELLO metadata map.
+fn extract_credentials(metadata: &HashMap<String, Value>) -> Option<&str> {
+    metadata.get("credentials").and_then(|v| match v {
+        Value::String(s) => Some(s.as_str()),
+        _ => None,
+    })
 }
 
 // ─── Bolt version negotiation ───
@@ -639,14 +727,6 @@ fn negotiate_bolt_version(versions: &[u8; 16]) -> bool {
 }
 
 // ─── Bolt framing ───
-
-/// Create a FAILURE response as bytes.
-fn failure_bytes(code: &str, message: &str) -> Bytes {
-    let failure =
-        bolt4rs::bolt::summary::Failure::new(code.to_string(), message.to_string());
-    let summary: Summary<success::Meta> = Summary::Failure(failure);
-    Bytes::from(summary.to_bytes().unwrap_or_default())
-}
 
 /// Read a chunked Bolt message from the stream.
 async fn read_chunked_message(stream: &mut BufStream<TcpStream>) -> Result<Option<Bytes>, String> {
@@ -706,62 +786,51 @@ async fn send_chunked_message(
 mod tests {
     use super::*;
 
-    // ─── bolt_type_to_json ───
+    // ─── bolt_value_to_json ───
 
     #[test]
     fn bolt_string_to_json() {
-        let bolt = BoltType::String(BoltString { value: "hello".into() });
-        assert_eq!(bolt_type_to_json(&bolt), serde_json::json!("hello"));
+        let bolt = Value::from("hello");
+        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!("hello"));
     }
 
     #[test]
     fn bolt_integer_to_json() {
-        let bolt = BoltType::Integer(BoltInteger { value: 42 });
-        assert_eq!(bolt_type_to_json(&bolt), serde_json::json!(42));
+        let bolt = Value::from(42i64);
+        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!(42));
     }
 
     #[test]
     fn bolt_float_to_json() {
-        let bolt = BoltType::Float(BoltFloat { value: 3.14 });
-        assert_eq!(bolt_type_to_json(&bolt), serde_json::json!(3.14));
+        let bolt = Value::from(3.14f64);
+        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!(3.14));
     }
 
     #[test]
     fn bolt_bool_to_json() {
-        let bolt = BoltType::Boolean(BoltBoolean { value: true });
-        assert_eq!(bolt_type_to_json(&bolt), serde_json::json!(true));
+        let bolt = Value::from(true);
+        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!(true));
     }
 
     #[test]
     fn bolt_null_to_json() {
-        let bolt = BoltType::Null(BoltNull {});
-        assert_eq!(bolt_type_to_json(&bolt), serde_json::Value::Null);
+        let bolt = Value::Null;
+        assert_eq!(bolt_value_to_json(&bolt), serde_json::Value::Null);
     }
 
     #[test]
     fn bolt_list_to_json() {
-        let bolt = BoltType::List(BoltList {
-            value: vec![
-                BoltType::Integer(BoltInteger { value: 1 }),
-                BoltType::String(BoltString { value: "two".into() }),
-            ],
-        });
-        assert_eq!(bolt_type_to_json(&bolt), serde_json::json!([1, "two"]));
+        let bolt = Value::from(vec![Value::from(1i64), Value::from("two")]);
+        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!([1, "two"]));
     }
 
     #[test]
     fn bolt_map_to_json() {
-        let mut map = BoltMap::new();
-        map.put(
-            BoltString { value: "name".into() },
-            BoltType::String(BoltString { value: "Alice".into() }),
-        );
-        map.put(
-            BoltString { value: "age".into() },
-            BoltType::Integer(BoltInteger { value: 30 }),
-        );
-        let bolt = BoltType::Map(map);
-        let json = bolt_type_to_json(&bolt);
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), Value::from("Alice"));
+        map.insert("age".to_string(), Value::from(30i64));
+        let bolt = Value::from(map);
+        let json = bolt_value_to_json(&bolt);
         assert_eq!(json["name"], "Alice");
         assert_eq!(json["age"], 30);
     }
@@ -770,17 +839,14 @@ mod tests {
 
     #[test]
     fn empty_params_returns_none() {
-        let params = BoltMap::new();
+        let params = HashMap::new();
         assert!(bolt_params_to_json(&params).is_none());
     }
 
     #[test]
     fn params_with_values() {
-        let mut params = BoltMap::new();
-        params.put(
-            BoltString { value: "name".into() },
-            BoltType::String(BoltString { value: "Bob".into() }),
-        );
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), Value::from("Bob"));
         let json = bolt_params_to_json(&params).unwrap();
         assert_eq!(json["name"], "Bob");
     }
@@ -790,17 +856,14 @@ mod tests {
     #[test]
     fn graph_null_to_bolt() {
         let gv = GraphValue::Null;
-        match graph_value_to_bolt(&gv) {
-            BoltType::Null(_) => {}
-            other => panic!("Expected Null, got {other:?}"),
-        }
+        assert_eq!(graph_value_to_bolt(&gv), Value::Null);
     }
 
     #[test]
     fn graph_bool_to_bolt() {
         let gv = GraphValue::Bool(true);
         match graph_value_to_bolt(&gv) {
-            BoltType::Boolean(b) => assert!(b.value),
+            Value::Boolean(b) => assert!(b),
             other => panic!("Expected Boolean, got {other:?}"),
         }
     }
@@ -809,7 +872,7 @@ mod tests {
     fn graph_int_to_bolt() {
         let gv = GraphValue::Int(99);
         match graph_value_to_bolt(&gv) {
-            BoltType::Integer(i) => assert_eq!(i.value, 99),
+            Value::Integer(i) => assert_eq!(i, 99),
             other => panic!("Expected Integer, got {other:?}"),
         }
     }
@@ -818,7 +881,7 @@ mod tests {
     fn graph_float_to_bolt() {
         let gv = GraphValue::Float(2.718);
         match graph_value_to_bolt(&gv) {
-            BoltType::Float(f) => assert!((f.value - 2.718).abs() < 1e-10),
+            Value::Float(f) => assert!((f - 2.718).abs() < 1e-10),
             other => panic!("Expected Float, got {other:?}"),
         }
     }
@@ -827,7 +890,7 @@ mod tests {
     fn graph_string_to_bolt() {
         let gv = GraphValue::String("hello".into());
         match graph_value_to_bolt(&gv) {
-            BoltType::String(s) => assert_eq!(s.value, "hello"),
+            Value::String(s) => assert_eq!(s, "hello"),
             other => panic!("Expected String, got {other:?}"),
         }
     }
@@ -836,10 +899,10 @@ mod tests {
     fn graph_list_to_bolt() {
         let gv = GraphValue::List(vec![GraphValue::Int(1), GraphValue::Int(2)]);
         match graph_value_to_bolt(&gv) {
-            BoltType::List(list) => {
-                assert_eq!(list.value.len(), 2);
-                match &list.value[0] {
-                    BoltType::Integer(i) => assert_eq!(i.value, 1),
+            Value::List(list) => {
+                assert_eq!(list.len(), 2);
+                match &list[0] {
+                    Value::Integer(i) => assert_eq!(*i, 1),
                     other => panic!("Expected Integer, got {other:?}"),
                 }
             }
@@ -853,10 +916,10 @@ mod tests {
         hm.insert("key".to_string(), GraphValue::String("value".into()));
         let gv = GraphValue::Map(hm);
         match graph_value_to_bolt(&gv) {
-            BoltType::Map(bmap) => {
-                let val = bmap.value.get("key").unwrap();
+            Value::Map(bmap) => {
+                let val = bmap.get("key").unwrap();
                 match val {
-                    BoltType::String(s) => assert_eq!(s.value, "value"),
+                    Value::String(s) => assert_eq!(s, "value"),
                     other => panic!("Expected String, got {other:?}"),
                 }
             }
@@ -868,16 +931,13 @@ mod tests {
 
     #[test]
     fn json_null_to_bolt() {
-        match json_to_bolt(&serde_json::Value::Null) {
-            BoltType::Null(_) => {}
-            other => panic!("Expected Null, got {other:?}"),
-        }
+        assert_eq!(json_to_bolt(&serde_json::Value::Null), Value::Null);
     }
 
     #[test]
     fn json_string_to_bolt() {
         match json_to_bolt(&serde_json::json!("test")) {
-            BoltType::String(s) => assert_eq!(s.value, "test"),
+            Value::String(s) => assert_eq!(s, "test"),
             other => panic!("Expected String, got {other:?}"),
         }
     }
@@ -885,7 +945,7 @@ mod tests {
     #[test]
     fn json_integer_to_bolt() {
         match json_to_bolt(&serde_json::json!(42)) {
-            BoltType::Integer(i) => assert_eq!(i.value, 42),
+            Value::Integer(i) => assert_eq!(i, 42),
             other => panic!("Expected Integer, got {other:?}"),
         }
     }
@@ -893,7 +953,7 @@ mod tests {
     #[test]
     fn json_float_to_bolt() {
         match json_to_bolt(&serde_json::json!(3.14)) {
-            BoltType::Float(f) => assert!((f.value - 3.14).abs() < 1e-10),
+            Value::Float(f) => assert!((f - 3.14).abs() < 1e-10),
             other => panic!("Expected Float, got {other:?}"),
         }
     }
@@ -901,7 +961,7 @@ mod tests {
     #[test]
     fn json_array_to_bolt() {
         match json_to_bolt(&serde_json::json!([1, "two"])) {
-            BoltType::List(list) => assert_eq!(list.value.len(), 2),
+            Value::List(list) => assert_eq!(list.len(), 2),
             other => panic!("Expected List, got {other:?}"),
         }
     }
@@ -909,11 +969,11 @@ mod tests {
     #[test]
     fn json_object_to_bolt() {
         match json_to_bolt(&serde_json::json!({"a": 1})) {
-            BoltType::Map(map) => {
-                assert_eq!(map.value.len(), 1);
-                let val = map.value.get("a").unwrap();
+            Value::Map(map) => {
+                assert_eq!(map.len(), 1);
+                let val = map.get("a").unwrap();
                 match val {
-                    BoltType::Integer(i) => assert_eq!(i.value, 1),
+                    Value::Integer(i) => assert_eq!(*i, 1),
                     other => panic!("Expected Integer, got {other:?}"),
                 }
             }
@@ -936,7 +996,7 @@ mod tests {
             }
         });
         let bolt = json_to_bolt(&original);
-        let back = bolt_type_to_json(&bolt);
+        let back = bolt_value_to_json(&bolt);
         assert_eq!(back["name"], "Alice");
         assert_eq!(back["age"], 30);
         assert_eq!(back["active"], true);
@@ -957,7 +1017,7 @@ mod tests {
             GraphValue::Null,
         ]);
         let bolt = graph_value_to_bolt(&gv);
-        let json = bolt_type_to_json(&bolt);
+        let json = bolt_value_to_json(&bolt);
         assert_eq!(json, serde_json::json!(["hello", 42, 1.5, false, null]));
     }
 
@@ -965,46 +1025,31 @@ mod tests {
 
     #[test]
     fn extract_credentials_basic_scheme() {
-        let mut extra = BoltMap::new();
-        extra.put(
-            BoltString { value: "scheme".into() },
-            BoltType::String(BoltString { value: "basic".into() }),
-        );
-        extra.put(
-            BoltString { value: "principal".into() },
-            BoltType::String(BoltString { value: "neo4j".into() }),
-        );
-        extra.put(
-            BoltString { value: "credentials".into() },
-            BoltType::String(BoltString { value: "my-secret-token".into() }),
-        );
-        assert_eq!(extract_credentials(&extra), Some("my-secret-token"));
+        let mut metadata = HashMap::new();
+        metadata.insert("scheme".to_string(), Value::from("basic"));
+        metadata.insert("principal".to_string(), Value::from("neo4j"));
+        metadata.insert("credentials".to_string(), Value::from("my-secret-token"));
+        assert_eq!(extract_credentials(&metadata), Some("my-secret-token"));
     }
 
     #[test]
     fn extract_credentials_missing() {
-        let extra = BoltMap::new();
-        assert_eq!(extract_credentials(&extra), None);
+        let metadata = HashMap::new();
+        assert_eq!(extract_credentials(&metadata), None);
     }
 
     #[test]
     fn extract_credentials_non_string() {
-        let mut extra = BoltMap::new();
-        extra.put(
-            BoltString { value: "credentials".into() },
-            BoltType::Integer(BoltInteger { value: 42 }),
-        );
-        assert_eq!(extract_credentials(&extra), None);
+        let mut metadata = HashMap::new();
+        metadata.insert("credentials".to_string(), Value::from(42i64));
+        assert_eq!(extract_credentials(&metadata), None);
     }
 
     #[test]
     fn extract_credentials_empty_string() {
-        let mut extra = BoltMap::new();
-        extra.put(
-            BoltString { value: "credentials".into() },
-            BoltType::String(BoltString { value: "".into() }),
-        );
-        assert_eq!(extract_credentials(&extra), Some(""));
+        let mut metadata = HashMap::new();
+        metadata.insert("credentials".to_string(), Value::from(""));
+        assert_eq!(extract_credentials(&metadata), Some(""));
     }
 
     // ─── negotiate_bolt_version ───
