@@ -142,7 +142,7 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
 
     // Blocking session worker.
     let worker_handle = tokio::task::spawn_blocking(move || {
-        bolt_session_worker(engine, tokens, req_rx, resp_tx);
+        bolt_session_worker(bolt_version, engine, tokens, req_rx, resp_tx);
     });
 
     // ── Message loop ──
@@ -202,6 +202,7 @@ enum BoltOp {
 
 /// Blocking session worker that owns the database connection.
 fn bolt_session_worker(
+    bolt_version: BoltVersion,
     engine: Arc<Engine>,
     tokens: Arc<TokenStore>,
     rx: tokio::sync::mpsc::UnboundedReceiver<BoltOp>,
@@ -251,6 +252,7 @@ fn bolt_session_worker(
         }
 
         let responses = handle_bolt_message(
+            bolt_version,
             &req,
             &conn,
             &tokens,
@@ -281,16 +283,38 @@ fn bolt_session_worker(
 /// ## Protocol Version Support
 ///
 /// **Bolt 4.4:**
-/// - HELLO, RUN, PULL, DISCARD, BEGIN, COMMIT, ROLLBACK, RESET, GOODBYE
+/// - Messages: HELLO, RUN, PULL, DISCARD, BEGIN, COMMIT, ROLLBACK, RESET, GOODBYE
 ///
-/// **Bolt 5.0-5.7:**
+/// **Bolt 5.0:**
 /// - All Bolt 4.4 messages
-/// - LOGON/LOGOFF (replaces HELLO for authentication, introduced in 5.0)
-/// - TELEMETRY (client telemetry reporting, introduced in 5.1)
+/// - Accepts `imp_user` metadata in ROUTE, RUN, BEGIN
 ///
-/// The implementation is compatible with all messages across all supported versions.
+/// **Bolt 5.1:**
+/// - LOGON/LOGOFF messages for authentication (replaces HELLO auth flow)
+///
+/// **Bolt 5.2:**
+/// - Accepts `notifications_minimum_severity` and `notifications_disabled_categories` in HELLO, RUN, BEGIN
+///
+/// **Bolt 5.3:**
+/// - Accepts `bolt_agent` metadata in HELLO/LOGON
+///
+/// **Bolt 5.4:**
+/// - TELEMETRY message for client metrics
+/// - Returns `telemetry.enabled` connection hint in HELLO/LOGON SUCCESS
+///
+/// **Bolt 5.6:**
+/// - `notifications_disabled_categories` renamed to `notifications_disabled_classifications`
+/// - Returns `statuses` instead of `notifications` in query responses (GQL standard)
+///
+/// **Bolt 5.7:**
+/// - GQL-compliant error reporting with `gql_status`, `neo4j_code`, `diagnostic_record`
+/// - Optional manifest v1 handshake (not yet implemented)
+///
+/// The implementation accepts all version-specific metadata fields and returns
+/// appropriate connection hints based on the negotiated protocol version.
 #[allow(deprecated)]
 fn handle_bolt_message<'db>(
+    bolt_version: BoltVersion,
     req: &Message,
     conn: &lbug::Connection<'db>,
     tokens: &Arc<TokenStore>,
@@ -341,6 +365,10 @@ fn handle_bolt_message<'db>(
                 Value::from(format!("Neo4j/5.x.0-graphd-{}", env!("CARGO_PKG_VERSION"))),
             );
             metadata.insert("connection_id".to_string(), Value::from("bolt-1"));
+
+            // Add connection hints based on Bolt version
+            add_connection_hints(bolt_version, &mut metadata);
+
             debug!("Sending HELLO SUCCESS with metadata: {:?}", metadata);
             let response = success_message(metadata);
             debug!("HELLO SUCCESS response has {} chunks", response.len());
@@ -641,6 +669,10 @@ fn handle_bolt_message<'db>(
                 Value::from(format!("Neo4j/5.x.0-graphd-{}", env!("CARGO_PKG_VERSION"))),
             );
             metadata.insert("connection_id".to_string(), Value::from("bolt-1"));
+
+            // Add connection hints based on Bolt version
+            add_connection_hints(bolt_version, &mut metadata);
+
             debug!("Sending LOGON SUCCESS with metadata: {:?}", metadata);
             success_message(metadata)
         }
@@ -787,12 +819,40 @@ fn json_to_bolt(v: &serde_json::Value) -> Value {
 
 // ─── Bolt auth ───
 
-/// Extract the "credentials" string from a HELLO metadata map.
+/// Extract the "credentials" string from a HELLO/LOGON metadata map.
 fn extract_credentials(metadata: &HashMap<String, Value>) -> Option<&str> {
     metadata.get("credentials").and_then(|v| match v {
         Value::String(s) => Some(s.as_str()),
         _ => None,
     })
+}
+
+// ─── Bolt connection hints ───
+
+/// Add version-specific connection hints to HELLO/LOGON SUCCESS metadata.
+///
+/// Connection hints inform the client about server capabilities and are introduced
+/// in specific Bolt protocol versions.
+fn add_connection_hints(bolt_version: BoltVersion, metadata: &mut HashMap<String, Value>) {
+    // Hints map (nested dictionary)
+    let mut hints = HashMap::new();
+
+    match bolt_version {
+        BoltVersion::V4_4 => {
+            // No connection hints in Bolt 4.4
+        }
+        BoltVersion::V5(minor) => {
+            // Bolt 5.4+: telemetry.enabled hint
+            if minor >= 4 {
+                hints.insert("telemetry.enabled".to_string(), Value::from(true));
+            }
+
+            // Add the hints map to metadata if not empty
+            if !hints.is_empty() {
+                metadata.insert("hints".to_string(), Value::from(hints));
+            }
+        }
+    }
 }
 
 // ─── Bolt version negotiation ───
