@@ -254,13 +254,6 @@ make e2e
 make bench
 ```
 
-Test coverage:
-- 165 unit tests
-- 44 integration tests
-- 8 config tests
-- 15 breaking/corruption tests
-- 44 end-to-end tests via Neo4j driver
-
 ## Development
 
 ```bash
