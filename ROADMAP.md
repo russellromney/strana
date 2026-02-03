@@ -994,17 +994,6 @@ Same approach as Mem0. Fork Graphiti's Kuzu backend, swap kuzu SDK for neo4j-dri
 - `QUERY_FTS_INDEX` for full-text search
 - `CAST()`, `list_concat()`
 
-## Phase 12: Cloud Deployment Reference Architecture
-
-Reference architecture for deploying graphd as a multi-tenant cloud service.
-
-- Per-tenant graphd instances with resource isolation
-- Bolt proxy: route connections by auth token to tenant databases
-- TLS termination at proxy layer
-- S3 snapshots for graph data (tar+zstd compression)
-- Management API: create/delete databases, view schema, execute queries
-- Monitoring: per-tenant metrics (storage, query volume, connection count)
-
 ## Phase 13: Replica Mode
 
 Enable graphd to run as a read-only replica that polls cloud storage for updates.

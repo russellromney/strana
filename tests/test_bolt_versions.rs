@@ -213,3 +213,66 @@ fn test_version_negotiation_skips_bolt_5_5() {
     // We technically support it even though Neo4j skipped it
     assert_eq!(version, Some(BoltVersion::V5(5)), "Should accept 5.5 (we support full range)");
 }
+
+// ── Version Limiting Tests (for testing) ───
+
+use graphd::bolt::negotiate_bolt_version_with_limit;
+
+#[test]
+fn test_version_limit_to_4_4() {
+    // Client proposes [5.7, 5.0, 4.4, 0.0]
+    let mut versions = [0u8; 16];
+    versions[0..4].copy_from_slice(&[0x00, 0x00, 0x07, 0x05]); // 5.7
+    versions[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
+    versions[8..12].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
+
+    let version = negotiate_bolt_version_with_limit(&versions, Some(BoltVersion::V4_4));
+    assert_eq!(version, Some(BoltVersion::V4_4), "Should limit to 4.4");
+}
+
+#[test]
+fn test_version_limit_to_5_0() {
+    // Client proposes [5.7, 5.0, 4.4, 0.0]
+    let mut versions = [0u8; 16];
+    versions[0..4].copy_from_slice(&[0x00, 0x00, 0x07, 0x05]); // 5.7
+    versions[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
+    versions[8..12].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
+
+    let version = negotiate_bolt_version_with_limit(&versions, Some(BoltVersion::V5(0)));
+    assert_eq!(version, Some(BoltVersion::V5(0)), "Should limit to 5.0");
+}
+
+#[test]
+fn test_version_limit_to_5_4() {
+    // Client proposes [5.7, 5.4, 5.0, 4.4]
+    let mut versions = [0u8; 16];
+    versions[0..4].copy_from_slice(&[0x00, 0x00, 0x07, 0x05]); // 5.7
+    versions[4..8].copy_from_slice(&[0x00, 0x00, 0x04, 0x05]); // 5.4
+    versions[8..12].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
+    versions[12..16].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
+
+    let version = negotiate_bolt_version_with_limit(&versions, Some(BoltVersion::V5(4)));
+    assert_eq!(version, Some(BoltVersion::V5(4)), "Should limit to 5.4");
+}
+
+#[test]
+fn test_version_limit_with_range() {
+    // Client proposes 5.7 with range 7 (accepts 5.7 down to 5.0)
+    // Limit to 5.2 - should match 5.2
+    let mut versions = [0u8; 16];
+    versions[0..4].copy_from_slice(&[0x00, 0x07, 0x07, 0x05]); // 5.7 with range 7
+
+    let version = negotiate_bolt_version_with_limit(&versions, Some(BoltVersion::V5(2)));
+    assert_eq!(version, Some(BoltVersion::V5(2)), "Should limit range to 5.2");
+}
+
+#[test]
+fn test_version_limit_below_client_minimum() {
+    // Client only proposes 5.7 (no range)
+    // Limit to 5.4 - should fail (client doesn't accept 5.4)
+    let mut versions = [0u8; 16];
+    versions[0..4].copy_from_slice(&[0x00, 0x00, 0x07, 0x05]); // 5.7 no range
+
+    let version = negotiate_bolt_version_with_limit(&versions, Some(BoltVersion::V5(4)));
+    assert_eq!(version, None, "Should fail when limit is below client minimum");
+}

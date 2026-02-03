@@ -101,7 +101,10 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
         .await
         .map_err(|e| format!("read versions: {e}"))?;
 
-    let bolt_version = match negotiate_bolt_version(&versions) {
+    // Check for artificial version limit (for testing)
+    let max_version = get_max_bolt_version_from_env();
+
+    let bolt_version = match negotiate_bolt_version_with_limit(&versions, max_version) {
         Some(version) => version,
         None => {
             // No supported version found — send zero version and close.
@@ -916,15 +919,53 @@ pub fn add_connection_hints(bolt_version: BoltVersion, metadata: &mut HashMap<St
 
 // ─── Bolt version negotiation ───
 
-/// Negotiate Bolt protocol version with the client.
+/// Get maximum Bolt version from environment (for testing).
+///
+/// Set BOLT_MAX_VERSION to limit negotiation (e.g., "4.4", "5.0", "5.7").
+/// This allows testing with older protocol versions by artificially limiting
+/// what the server will negotiate.
+fn get_max_bolt_version_from_env() -> Option<BoltVersion> {
+    std::env::var("BOLT_MAX_VERSION").ok().and_then(|s| {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 2 {
+            warn!("Invalid BOLT_MAX_VERSION format: {}", s);
+            return None;
+        }
+
+        let major = parts[0].parse::<u8>().ok()?;
+        let minor = parts[1].parse::<u8>().ok()?;
+
+        match (major, minor) {
+            (4, 4) => Some(BoltVersion::V4_4),
+            (5, m) if m <= 7 => Some(BoltVersion::V5(m)),
+            _ => {
+                warn!("Unsupported BOLT_MAX_VERSION: {}.{}", major, minor);
+                None
+            }
+        }
+    })
+}
+
+/// Negotiate Bolt protocol version with the client, with optional version limit.
+///
 /// Each proposal is 4 bytes: [patch, range, minor, major].
 /// `range` means the client accepts major.minor down to major.(minor - range).
-/// Prefers the highest supported version.
+/// Prefers the highest supported version up to the limit.
 ///
 /// Supports Bolt 4.4 and Bolt 5.0-5.7.
 #[cfg_attr(test, allow(dead_code))]
-pub fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
+pub fn negotiate_bolt_version_with_limit(
+    versions: &[u8; 16],
+    max_version: Option<BoltVersion>,
+) -> Option<BoltVersion> {
     const MAX_BOLT_5_MINOR: u8 = 7;
+
+    // Determine effective max version
+    let (max_5_minor, allow_5_x, allow_4_4) = match max_version {
+        Some(BoltVersion::V4_4) => (0, false, true), // Only allow 4.4
+        Some(BoltVersion::V5(m)) => (m, true, true), // Allow 5.0-5.m and 4.4
+        None => (MAX_BOLT_5_MINOR, true, true),       // Allow all versions
+    };
 
     // Try to negotiate highest version first (5.7 > ... > 5.0 > 4.4)
     for i in 0..4 {
@@ -934,12 +975,12 @@ pub fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
         let range = versions[offset + 1];
 
         // Check for Bolt 5.x (client accepts versions in range)
-        if major == 5 {
+        if allow_5_x && major == 5 {
             let min_minor = minor.saturating_sub(range);
             let max_minor = minor;
 
-            // Find the highest version we support that the client accepts
-            for supported_minor in (0..=MAX_BOLT_5_MINOR).rev() {
+            // Find the highest version we support that the client accepts (up to limit)
+            for supported_minor in (0..=max_5_minor.min(MAX_BOLT_5_MINOR)).rev() {
                 if supported_minor >= min_minor && supported_minor <= max_minor {
                     return Some(BoltVersion::V5(supported_minor));
                 }
@@ -947,12 +988,20 @@ pub fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
         }
 
         // Check for Bolt 4.4 (client accepts versions including 4.4)
-        if major == 4 && minor >= 4 && minor.saturating_sub(range) <= 4 {
+        if allow_4_4 && major == 4 && minor >= 4 && minor.saturating_sub(range) <= 4 {
             return Some(BoltVersion::V4_4);
         }
     }
 
     None
+}
+
+/// Negotiate Bolt protocol version with the client.
+///
+/// Public version without limit, used by tests and as a convenience wrapper.
+#[cfg_attr(test, allow(dead_code))]
+pub fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
+    negotiate_bolt_version_with_limit(versions, None)
 }
 
 #[cfg(test)]
