@@ -20,8 +20,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoltVersion {
     V4_4,
-    V5_0,
-    V5_1,
+    /// Bolt 5.x where the u8 is the minor version (0-7 for Bolt 5.0-5.7)
+    V5(u8),
 }
 
 /// Shared state for the Bolt listener.
@@ -117,15 +117,19 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
     // Send negotiated version back to client
     let version_bytes = match bolt_version {
         BoltVersion::V4_4 => [0x00, 0x00, 0x04, 0x04],
-        BoltVersion::V5_0 => [0x00, 0x00, 0x00, 0x05],
-        BoltVersion::V5_1 => [0x00, 0x00, 0x01, 0x05],
+        BoltVersion::V5(minor) => [0x00, 0x00, minor, 0x05],
     };
     stream
         .write_all(&version_bytes)
         .await
         .map_err(|e| format!("write version: {e}"))?;
     stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-    info!("Negotiated Bolt version: {:?}", bolt_version);
+
+    let version_str = match bolt_version {
+        BoltVersion::V4_4 => "4.4".to_string(),
+        BoltVersion::V5(minor) => format!("5.{}", minor),
+    };
+    info!("Negotiated Bolt version: {}", version_str);
 
     // ── Spawn blocking session worker ──
     // The Bolt session owns a database connection and runs queries on it.
@@ -273,6 +277,18 @@ fn bolt_session_worker(
 }
 
 /// Handle a single Bolt message, returning response bytes.
+///
+/// ## Protocol Version Support
+///
+/// **Bolt 4.4:**
+/// - HELLO, RUN, PULL, DISCARD, BEGIN, COMMIT, ROLLBACK, RESET, GOODBYE
+///
+/// **Bolt 5.0-5.7:**
+/// - All Bolt 4.4 messages
+/// - LOGON/LOGOFF (replaces HELLO for authentication, introduced in 5.0)
+/// - TELEMETRY (client telemetry reporting, introduced in 5.1)
+///
+/// The implementation is compatible with all messages across all supported versions.
 #[allow(deprecated)]
 fn handle_bolt_message<'db>(
     req: &Message,
@@ -587,21 +603,21 @@ fn handle_bolt_message<'db>(
             Vec::new() // No response needed, connection will close
         }
 
-        // ── LOGON (Bolt 5.0) ──
+        // ── LOGON (Bolt 5.x) ──
         Message::Logon(logon) => {
-            // LOGON replaces HELLO in Bolt 5.0
+            // LOGON replaces HELLO in Bolt 5.0+
             // Handle authentication the same way as HELLO
             if tokens.is_empty() {
                 // Open access — no tokens configured.
                 *authenticated = true;
-                info!("Bolt 5.0: client connected (open access)");
+                info!("Bolt 5.x: client connected (open access)");
             } else {
                 // Extract credentials from LOGON metadata map.
                 match extract_credentials(logon.metadata()) {
                     Some(token) => match tokens.validate(token) {
                         Ok(label) => {
                             *authenticated = true;
-                            info!("Bolt 5.0: authenticated (label={label})");
+                            info!("Bolt 5.x: authenticated (label={label})");
                         }
                         Err(_) => {
                             return failure_message(
@@ -629,7 +645,7 @@ fn handle_bolt_message<'db>(
             success_message(metadata)
         }
 
-        // ── LOGOFF (Bolt 5.0) ──
+        // ── LOGOFF (Bolt 5.x) ──
         Message::Logoff(_) => {
             debug!("Received LOGOFF, closing connection");
             success_message(HashMap::new())
@@ -785,22 +801,29 @@ fn extract_credentials(metadata: &HashMap<String, Value>) -> Option<&str> {
 /// Each proposal is 4 bytes: [patch, range, minor, major].
 /// `range` means the client accepts major.minor down to major.(minor - range).
 /// Prefers the highest supported version.
+///
+/// Supports Bolt 4.4 and Bolt 5.0-5.7.
 fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
-    // Try to negotiate highest version first (5.1 > 5.0 > 4.4)
+    const MAX_BOLT_5_MINOR: u8 = 7;
+
+    // Try to negotiate highest version first (5.7 > ... > 5.0 > 4.4)
     for i in 0..4 {
         let offset = i * 4;
         let major = versions[offset + 3];
         let minor = versions[offset + 2];
         let range = versions[offset + 1];
 
-        // Check for Bolt 5.1 (client accepts versions including 5.1)
-        if major == 5 && minor >= 1 && minor.saturating_sub(range) <= 1 {
-            return Some(BoltVersion::V5_1);
-        }
+        // Check for Bolt 5.x (client accepts versions in range)
+        if major == 5 {
+            let min_minor = minor.saturating_sub(range);
+            let max_minor = minor;
 
-        // Check for Bolt 5.0 (client accepts versions from 5.0 to 5.0)
-        if major == 5 && minor.saturating_sub(range) == 0 {
-            return Some(BoltVersion::V5_0);
+            // Find the highest version we support that the client accepts
+            for supported_minor in (0..=MAX_BOLT_5_MINOR).rev() {
+                if supported_minor >= min_minor && supported_minor <= max_minor {
+                    return Some(BoltVersion::V5(supported_minor));
+                }
+            }
         }
 
         // Check for Bolt 4.4 (client accepts versions including 4.4)
@@ -1113,7 +1136,7 @@ mod tests {
         // Client proposes 5.0.
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_0));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(0)));
     }
 
     #[test]
@@ -1121,7 +1144,7 @@ mod tests {
         // Client proposes 5.1.
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0x05]); // 5.1
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(1)));
     }
 
     #[test]
@@ -1131,7 +1154,7 @@ mod tests {
         v[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0x05]); // 5.1
         v[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
         v[8..12].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(1)));
     }
 
     #[test]
@@ -1162,7 +1185,7 @@ mod tests {
         // Client proposes 5.1 with range 1 → accepts 5.1 and 5.0.
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x01, 0x01, 0x05]);
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(1)));
     }
 
     #[test]
@@ -1172,23 +1195,48 @@ mod tests {
         // This lenient behavior is acceptable for malformed input
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x02, 0x01, 0x05]); // 5.1 with range 2
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(1)));
     }
 
     #[test]
-    fn version_5_2_down_to_5_0_matches_5_1() {
+    fn version_5_2_down_to_5_0_matches_5_2() {
         // Client proposes 5.2 with range 2 → accepts 5.2, 5.1, 5.0
-        // Should match 5.1 (highest we support in that range)
+        // Should match 5.2 (highest we support in that range, since we now support up to 5.7)
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x02, 0x02, 0x05]); // 5.2 with range 2
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(2)));
     }
 
     #[test]
-    fn version_5_2_no_range_no_match() {
-        // Client proposes only 5.2 (no range) → we don't support 5.2
+    fn version_5_2_no_range_matches_5_2() {
+        // Client proposes only 5.2 (no range) → we now support 5.2
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x00, 0x02, 0x05]); // 5.2 no range
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(2)));
+    }
+
+    #[test]
+    fn version_5_7() {
+        // Client proposes 5.7 (latest supported).
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x00, 0x07, 0x05]); // 5.7
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(7)));
+    }
+
+    #[test]
+    fn version_5_8_not_supported() {
+        // Client proposes 5.8 → we only support up to 5.7
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x00, 0x08, 0x05]); // 5.8
         assert_eq!(negotiate_bolt_version(&v), None);
+    }
+
+    #[test]
+    fn version_5_10_with_range_matches_5_7() {
+        // Client proposes 5.10 with range 5 → accepts 5.10 down to 5.5
+        // Should match 5.7 (highest we support in that range)
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x05, 0x0A, 0x05]); // 5.10 with range 5
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(7)));
     }
 }
