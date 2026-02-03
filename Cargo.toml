@@ -38,8 +38,8 @@ aws-sdk-s3 = "1"
 tar = "0.4"
 zstd = "0.13"
 
-# Bolt protocol
-bolt-proto = "0.12.0"
+# Bolt protocol (forked for 5.x support)
+bolt-proto = { git = "https://github.com/russellromney/bolt-rs.git", branch = "bolt-5x-support" }
 futures-util = "0.3"
 bytes = "1.0"
 tokio-util = { version = "0.7", features = ["compat"] }

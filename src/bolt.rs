@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -16,7 +16,13 @@ use bolt_proto::{Message, Value};
 use bolt_proto::message::{Record, Success, Failure};
 use std::collections::HashMap;
 
-const MAX_CHUNK_SIZE: usize = 65_535;
+/// Bolt protocol version negotiated with the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoltVersion {
+    V4_4,
+    V5_0,
+    V5_1,
+}
 
 /// Shared state for the Bolt listener.
 #[derive(Clone)]
@@ -95,21 +101,31 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
         .await
         .map_err(|e| format!("read versions: {e}"))?;
 
-    if !negotiate_bolt_version(&versions) {
-        // No supported version found — send zero version and close.
-        stream
-            .write_all(&[0x00, 0x00, 0x00, 0x00])
-            .await
-            .map_err(|e| format!("write version: {e}"))?;
-        stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-        return Err("No supported Bolt version in client proposals".into());
-    }
+    let bolt_version = match negotiate_bolt_version(&versions) {
+        Some(version) => version,
+        None => {
+            // No supported version found — send zero version and close.
+            stream
+                .write_all(&[0x00, 0x00, 0x00, 0x00])
+                .await
+                .map_err(|e| format!("write version: {e}"))?;
+            stream.flush().await.map_err(|e| format!("flush: {e}"))?;
+            return Err("No supported Bolt version in client proposals".into());
+        }
+    };
 
+    // Send negotiated version back to client
+    let version_bytes = match bolt_version {
+        BoltVersion::V4_4 => [0x00, 0x00, 0x04, 0x04],
+        BoltVersion::V5_0 => [0x00, 0x00, 0x00, 0x05],
+        BoltVersion::V5_1 => [0x00, 0x00, 0x01, 0x05],
+    };
     stream
-        .write_all(&[0x00, 0x00, 0x04, 0x04])
+        .write_all(&version_bytes)
         .await
         .map_err(|e| format!("write version: {e}"))?;
     stream.flush().await.map_err(|e| format!("flush: {e}"))?;
+    info!("Negotiated Bolt version: {:?}", bolt_version);
 
     // ── Spawn blocking session worker ──
     // The Bolt session owns a database connection and runs queries on it.
@@ -571,6 +587,61 @@ fn handle_bolt_message<'db>(
             Vec::new() // No response needed, connection will close
         }
 
+        // ── LOGON (Bolt 5.0) ──
+        Message::Logon(logon) => {
+            // LOGON replaces HELLO in Bolt 5.0
+            // Handle authentication the same way as HELLO
+            if tokens.is_empty() {
+                // Open access — no tokens configured.
+                *authenticated = true;
+                info!("Bolt 5.0: client connected (open access)");
+            } else {
+                // Extract credentials from LOGON metadata map.
+                match extract_credentials(logon.metadata()) {
+                    Some(token) => match tokens.validate(token) {
+                        Ok(label) => {
+                            *authenticated = true;
+                            info!("Bolt 5.0: authenticated (label={label})");
+                        }
+                        Err(_) => {
+                            return failure_message(
+                                "Neo.ClientError.Security.Unauthorized",
+                                "Invalid credentials",
+                            );
+                        }
+                    },
+                    None => {
+                        return failure_message(
+                            "Neo.ClientError.Security.Unauthorized",
+                            "Authentication required: provide credentials in LOGON",
+                        );
+                    }
+                }
+            }
+
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "server".to_string(),
+                Value::from(format!("Neo4j/5.x.0-graphd-{}", env!("CARGO_PKG_VERSION"))),
+            );
+            metadata.insert("connection_id".to_string(), Value::from("bolt-1"));
+            debug!("Sending LOGON SUCCESS with metadata: {:?}", metadata);
+            success_message(metadata)
+        }
+
+        // ── LOGOFF (Bolt 5.0) ──
+        Message::Logoff(_) => {
+            debug!("Received LOGOFF, closing connection");
+            success_message(HashMap::new())
+        }
+
+        // ── TELEMETRY (Bolt 5.1) ──
+        Message::Telemetry(telemetry) => {
+            debug!("Received TELEMETRY: api={}", telemetry.api());
+            // Accept and acknowledge telemetry data
+            success_message(HashMap::new())
+        }
+
         // Catch-all for unsupported messages
         _ => {
             warn!("Unsupported Bolt message: {:?}", req);
@@ -710,76 +781,35 @@ fn extract_credentials(metadata: &HashMap<String, Value>) -> Option<&str> {
 
 // ─── Bolt version negotiation ───
 
-/// Check if any of the 4 client-proposed versions includes Bolt 4.4.
+/// Negotiate Bolt protocol version with the client.
 /// Each proposal is 4 bytes: [patch, range, minor, major].
 /// `range` means the client accepts major.minor down to major.(minor - range).
-fn negotiate_bolt_version(versions: &[u8; 16]) -> bool {
+/// Prefers the highest supported version.
+fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
+    // Try to negotiate highest version first (5.1 > 5.0 > 4.4)
     for i in 0..4 {
         let offset = i * 4;
         let major = versions[offset + 3];
         let minor = versions[offset + 2];
         let range = versions[offset + 1];
-        if major == 4 && minor >= 4 && (minor - range) <= 4 {
-            return true;
+
+        // Check for Bolt 5.1 (client accepts versions including 5.1)
+        if major == 5 && minor >= 1 && minor.saturating_sub(range) <= 1 {
+            return Some(BoltVersion::V5_1);
+        }
+
+        // Check for Bolt 5.0 (client accepts versions from 5.0 to 5.0)
+        if major == 5 && minor.saturating_sub(range) == 0 {
+            return Some(BoltVersion::V5_0);
+        }
+
+        // Check for Bolt 4.4 (client accepts versions including 4.4)
+        if major == 4 && minor >= 4 && minor.saturating_sub(range) <= 4 {
+            return Some(BoltVersion::V4_4);
         }
     }
-    false
-}
 
-// ─── Bolt framing ───
-
-/// Read a chunked Bolt message from the stream.
-async fn read_chunked_message(stream: &mut BufStream<TcpStream>) -> Result<Option<Bytes>, String> {
-    let mut message = BytesMut::new();
-
-    loop {
-        let mut size_bytes = [0u8; 2];
-        match stream.read_exact(&mut size_bytes).await {
-            Ok(_) => {
-                let chunk_size = u16::from_be_bytes(size_bytes) as usize;
-                if chunk_size == 0 {
-                    return Ok(if message.is_empty() {
-                        None
-                    } else {
-                        Some(message.freeze())
-                    });
-                }
-                let mut chunk = vec![0u8; chunk_size];
-                stream
-                    .read_exact(&mut chunk)
-                    .await
-                    .map_err(|e| format!("read chunk: {e}"))?;
-                message.extend_from_slice(&chunk);
-            }
-            Err(_) => {
-                return Ok(None);
-            }
-        }
-    }
-}
-
-/// Send a chunked Bolt message over the stream.
-async fn send_chunked_message(
-    stream: &mut BufStream<TcpStream>,
-    message: Bytes,
-) -> Result<(), String> {
-    for chunk in message.chunks(MAX_CHUNK_SIZE) {
-        let chunk_len = chunk.len() as u16;
-        stream
-            .write_all(&chunk_len.to_be_bytes())
-            .await
-            .map_err(|e| format!("write chunk len: {e}"))?;
-        stream
-            .write_all(chunk)
-            .await
-            .map_err(|e| format!("write chunk: {e}"))?;
-    }
-    stream
-        .write_all(&[0, 0])
-        .await
-        .map_err(|e| format!("write end marker: {e}"))?;
-    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-    Ok(())
+    None
 }
 
 #[cfg(test)]
@@ -1059,7 +1089,7 @@ mod tests {
         // Client proposes exactly 4.4 in first slot.
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
-        assert!(negotiate_bolt_version(&v));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V4_4));
     }
 
     #[test]
@@ -1067,7 +1097,7 @@ mod tests {
         // Client proposes 4.4 with range 2 → accepts 4.4, 4.3, 4.2.
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x02, 0x04, 0x04]);
-        assert!(negotiate_bolt_version(&v));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V4_4));
     }
 
     #[test]
@@ -1075,30 +1105,48 @@ mod tests {
         // Client proposes only 4.3 — no range includes 4.4.
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x00, 0x03, 0x04]); // 4.3
-        assert!(!negotiate_bolt_version(&v));
+        assert_eq!(negotiate_bolt_version(&v), None);
     }
 
     #[test]
-    fn version_5_0_with_range() {
-        // Client proposes 5.0 with range 0 — doesn't include 4.x.
+    fn version_5_0() {
+        // Client proposes 5.0.
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
-        assert!(!negotiate_bolt_version(&v));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_0));
+    }
+
+    #[test]
+    fn version_5_1() {
+        // Client proposes 5.1.
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0x05]); // 5.1
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+    }
+
+    #[test]
+    fn version_prefers_highest() {
+        // Client proposes 5.1, 5.0, 4.4 — should prefer 5.1.
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0x05]); // 5.1
+        v[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
+        v[8..12].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
     }
 
     #[test]
     fn version_in_second_slot() {
-        // First slot is unsupported, second slot is 4.4.
+        // First slot is unsupported version 6.0, second slot is 4.4.
         let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
+        v[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x06]); // 6.0 (unsupported)
         v[4..8].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
-        assert!(negotiate_bolt_version(&v));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V4_4));
     }
 
     #[test]
     fn version_all_zeros() {
         let v = [0u8; 16];
-        assert!(!negotiate_bolt_version(&v));
+        assert_eq!(negotiate_bolt_version(&v), None);
     }
 
     #[test]
@@ -1106,6 +1154,41 @@ mod tests {
         // Client proposes 4.6 with range 3 → accepts 4.6, 4.5, 4.4, 4.3.
         let mut v = [0u8; 16];
         v[0..4].copy_from_slice(&[0x00, 0x03, 0x06, 0x04]);
-        assert!(negotiate_bolt_version(&v));
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V4_4));
+    }
+
+    #[test]
+    fn version_5_1_with_range() {
+        // Client proposes 5.1 with range 1 → accepts 5.1 and 5.0.
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x01, 0x01, 0x05]);
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+    }
+
+    #[test]
+    fn version_malformed_range_greater_than_minor() {
+        // Malformed: range > minor (5.1 with range 2 claims to accept down to 5.-1)
+        // With saturating_sub, treats as accepting down to 5.0, so matches 5.1
+        // This lenient behavior is acceptable for malformed input
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x02, 0x01, 0x05]); // 5.1 with range 2
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+    }
+
+    #[test]
+    fn version_5_2_down_to_5_0_matches_5_1() {
+        // Client proposes 5.2 with range 2 → accepts 5.2, 5.1, 5.0
+        // Should match 5.1 (highest we support in that range)
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x02, 0x02, 0x05]); // 5.2 with range 2
+        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5_1));
+    }
+
+    #[test]
+    fn version_5_2_no_range_no_match() {
+        // Client proposes only 5.2 (no range) → we don't support 5.2
+        let mut v = [0u8; 16];
+        v[0..4].copy_from_slice(&[0x00, 0x00, 0x02, 0x05]); // 5.2 no range
+        assert_eq!(negotiate_bolt_version(&v), None);
     }
 }
