@@ -1,4 +1,4 @@
-.PHONY: setup-lbug test build clean help
+.PHONY: setup-lbug test build clean help e2e bench
 
 LBUG_VERSION := v0.14.1
 LBUG_ARCHIVE := liblbug-osx-universal.tar.gz
@@ -23,5 +23,15 @@ test: ## Run all tests
 build: ## Build the project
 	~/.cargo/bin/cargo build
 
+e2e: build ## Run end-to-end tests via neo4j Python driver
+	cd tests/e2e && pip install -q -r requirements.txt && \
+	DYLD_LIBRARY_PATH=$(CURDIR)/lbug-lib \
+	GRAPHD_BINARY=$(CURDIR)/target/debug/graphd \
+	STRANA_ROOT=$(CURDIR) \
+	python3 test_e2e.py -v
+
 clean: ## Clean build artifacts
 	~/.cargo/bin/cargo clean
+
+bench: ## Run benchmarks
+	DYLD_LIBRARY_PATH=$(CURDIR)/lbug-lib ~/.cargo/bin/cargo bench

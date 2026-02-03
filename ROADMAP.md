@@ -6,6 +6,21 @@ Key insight: Mem0 and Graphiti both already have Kuzu backends that emit compati
 
 Cloud-first: Cinch hosts graphd as a managed service. Open source later.
 
+## Phase 8-hardening: Production Hardening
+
+Security, data safety, and concurrency fixes for Bolt + Neo4j HTTP consolidation.
+
+- **Bolt auth enforcement**: Parse HELLO credentials, validate against TokenStore (fix: bolt4rs extra() accessor + bolt.rs handler)
+- **Journal reliability**: Log errors on failed sends, detect writer thread crash via AtomicBool health flag
+- **Transaction lock contention**: Wrap TransactionState in Arc, drop map lock before blocking channel operations
+- **Transaction reaper**: Periodic cleanup of abandoned HTTP transactions (configurable TTL via --tx-timeout-secs)
+- **Graceful shutdown**: SIGTERM/SIGINT handler, journal flush, axum with_graceful_shutdown, Bolt listener drain
+- **Bolt version negotiation**: Parse client proposals, reject if 4.4 not offered
+- **Bolt connection limits**: Semaphore-based limit (--bolt-max-connections)
+- **RwLock poisoning resilience**: Replace .unwrap() with recovery pattern across all lock sites
+- **Rewriter param prefix**: Rename generated params to __graphd_* prefix to avoid user collisions
+- **Dead code cleanup**: Remove unused fields/functions flagged by compiler
+
 ## Phase 8: Bolt Server
 
 Ship graphd with a production Bolt endpoint.
@@ -219,4 +234,4 @@ Add graph as a second engine type in cinch-cloud (alongside Redis cache).
 - Cognee verification (third AI memory framework)
 - APOC-compatible procedure library (most-used subset)
 - Bolt 5.5+ features (routing, multi-database) if needed for cloud proxy
-- Encryption at rest (AES-256-GCM on journal segments and snapshots)
+- zstd dictionary training for journal compression (5-10% additional compression on Cypher patterns, requires dictionary versioning and distribution)

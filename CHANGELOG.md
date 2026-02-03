@@ -1,5 +1,19 @@
 # Changelog
 
+## Phase 8: GraphJ File Format
+
+- **Universal journal format** (`src/graphj.rs`): `.graphj` container format replacing raw `.wal` files. 128-byte fixed header + variable body. Supports live segments (unsealed, raw), compacted archives (sealed, optionally compressed/encrypted), and S3 uploads.
+- **Built-in compression**: zstd compression (configurable level, default 3) for sealed segments. Flag: `--journal-compress`, `--journal-compress-level`.
+- **Built-in encryption**: XChaCha20-Poly1305 AEAD encryption for sealed segments with 32-byte keys. AEAD AAD binds ciphertext to header metadata (first 40 bytes). Flag: `--journal-encryption-key` (64-char hex).
+- **Backward compatibility**: Legacy `.wal` files detected by magic byte check. Reader transparently handles mixed `.wal`/`.graphj` directories.
+- **Sealing**: Live segments written unsealed (entries appended incrementally), sealed on rotation/shutdown with final sequence range, entry count, body length, and SHA-256 checksum.
+- **Reader integration**: `JournalReader::from_sequence_with_key()` decrypts sealed encrypted segments transparently. Restore function accepts optional encryption key.
+- **Security**: SHA-256 body checksum + per-entry CRC32C + chain hashing + AEAD authentication. Tamper detection for both header and ciphertext.
+- **Config integration**: Encryption key parsed from hex at startup, passed through to journal reader and restore operations. Compression settings stored in `EngineManagerConfig` for future compaction use.
+- **Comprehensive testing**: 15 graphj unit tests (header encoding, compression, encryption, compaction, tampering, wrong key, mixed segments). 8 config tests for CLI flags and validation. 15 breaking tests for corruption, edge cases, and error handling (truncated headers, checksum mismatches, invalid sequences, encryption without keys, max field values).
+- **Performance benchmarks** (`benches/graphj_bench.rs`): Criterion-based benchmarks measuring header encode/decode, compression at different levels (1-22), encryption/decryption, combined operations, compaction (5 segments), and scaling across data sizes (10-10000 queries). Includes realistic Cypher query generation and throughput measurements.
+- 165 unit tests, 165 binary tests, 44 integration tests, 8 config tests, 15 breaking tests (397 total)
+
 ## Phase 7-fix: Backup System Bug Fixes
 
 - **Journal chain survives restart**: Added `recover_journal_state()` that scans existing segments on startup to recover last sequence + chain hash, instead of always starting at seq=0/hash=zeros.
