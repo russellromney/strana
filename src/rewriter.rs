@@ -13,9 +13,9 @@ pub struct RewriteResult {
 /// Rewrite non-deterministic function calls in a Cypher query.
 ///
 /// Replaces:
-///   gen_random_uuid()   -> $_uuid_N   (UUID v4 string value)
-///   current_timestamp() -> $_now_N    (ISO 8601 timestamp string)
-///   current_date()      -> $_date_N   (ISO 8601 date string)
+///   gen_random_uuid()   -> $__graphd_uuid_N   (UUID v4 string value)
+///   current_timestamp() -> $__graphd_now_N    (ISO 8601 timestamp string)
+///   current_date()      -> $__graphd_date_N   (ISO 8601 date string)
 ///
 /// Does NOT rewrite inside string literals ('...' or "...").
 /// Case-insensitive. Handles optional whitespace between name and `()`.
@@ -63,17 +63,17 @@ pub fn rewrite_query(query: &str) -> RewriteResult {
                 0 => {
                     let n = counters[0];
                     counters[0] += 1;
-                    (format!("$_uuid_{n}"), format!("_uuid_{n}"), Uuid::new_v4().to_string())
+                    (format!("$__graphd_uuid_{n}"), format!("__graphd_uuid_{n}"), Uuid::new_v4().to_string())
                 }
                 1 => {
                     let n = counters[1];
                     counters[1] += 1;
-                    (format!("$_now_{n}"), format!("_now_{n}"), generate_timestamp())
+                    (format!("$__graphd_now_{n}"), format!("__graphd_now_{n}"), generate_timestamp())
                 }
                 _ => {
                     let n = counters[2];
                     counters[2] += 1;
-                    (format!("$_date_{n}"), format!("_date_{n}"), generate_date())
+                    (format!("$__graphd_date_{n}"), format!("__graphd_date_{n}"), generate_date())
                 }
             };
             output.extend_from_slice(param_ref.as_bytes());
@@ -216,9 +216,9 @@ mod tests {
     #[test]
     fn test_rewrite_gen_random_uuid() {
         let r = rewrite_query("CREATE (:T {id: gen_random_uuid()})");
-        assert_eq!(r.query, "CREATE (:T {id: $_uuid_0})");
+        assert_eq!(r.query, "CREATE (:T {id: $__graphd_uuid_0})");
         assert_eq!(r.generated_params.len(), 1);
-        assert_eq!(r.generated_params[0].0, "_uuid_0");
+        assert_eq!(r.generated_params[0].0, "__graphd_uuid_0");
         // Value should be a valid UUID
         let val = r.generated_params[0].1.as_str().unwrap();
         assert!(uuid::Uuid::parse_str(val).is_ok(), "Not a valid UUID: {val}");
@@ -227,9 +227,9 @@ mod tests {
     #[test]
     fn test_rewrite_current_timestamp() {
         let r = rewrite_query("RETURN current_timestamp() AS ts");
-        assert_eq!(r.query, "RETURN $_now_0 AS ts");
+        assert_eq!(r.query, "RETURN $__graphd_now_0 AS ts");
         assert_eq!(r.generated_params.len(), 1);
-        assert_eq!(r.generated_params[0].0, "_now_0");
+        assert_eq!(r.generated_params[0].0, "__graphd_now_0");
         let val = r.generated_params[0].1.as_str().unwrap();
         // Should match ISO 8601: YYYY-MM-DDThh:mm:ss.uuuuuu
         assert!(val.len() >= 26, "Timestamp too short: {val}");
@@ -244,9 +244,9 @@ mod tests {
     #[test]
     fn test_rewrite_current_date() {
         let r = rewrite_query("RETURN current_date() AS d");
-        assert_eq!(r.query, "RETURN $_date_0 AS d");
+        assert_eq!(r.query, "RETURN $__graphd_date_0 AS d");
         assert_eq!(r.generated_params.len(), 1);
-        assert_eq!(r.generated_params[0].0, "_date_0");
+        assert_eq!(r.generated_params[0].0, "__graphd_date_0");
         let val = r.generated_params[0].1.as_str().unwrap();
         // Should match YYYY-MM-DD
         assert_eq!(val.len(), 10, "Date wrong length: {val}");
@@ -257,10 +257,10 @@ mod tests {
     #[test]
     fn test_rewrite_multiple_same_function() {
         let r = rewrite_query("CREATE (:T {a: gen_random_uuid(), b: gen_random_uuid()})");
-        assert_eq!(r.query, "CREATE (:T {a: $_uuid_0, b: $_uuid_1})");
+        assert_eq!(r.query, "CREATE (:T {a: $__graphd_uuid_0, b: $__graphd_uuid_1})");
         assert_eq!(r.generated_params.len(), 2);
-        assert_eq!(r.generated_params[0].0, "_uuid_0");
-        assert_eq!(r.generated_params[1].0, "_uuid_1");
+        assert_eq!(r.generated_params[0].0, "__graphd_uuid_0");
+        assert_eq!(r.generated_params[1].0, "__graphd_uuid_1");
         // Values should be distinct
         assert_ne!(r.generated_params[0].1, r.generated_params[1].1);
     }
@@ -272,12 +272,12 @@ mod tests {
         );
         assert_eq!(
             r.query,
-            "CREATE (:T {id: $_uuid_0, ts: $_now_0, d: $_date_0})"
+            "CREATE (:T {id: $__graphd_uuid_0, ts: $__graphd_now_0, d: $__graphd_date_0})"
         );
         assert_eq!(r.generated_params.len(), 3);
-        assert_eq!(r.generated_params[0].0, "_uuid_0");
-        assert_eq!(r.generated_params[1].0, "_now_0");
-        assert_eq!(r.generated_params[2].0, "_date_0");
+        assert_eq!(r.generated_params[0].0, "__graphd_uuid_0");
+        assert_eq!(r.generated_params[1].0, "__graphd_now_0");
+        assert_eq!(r.generated_params[2].0, "__graphd_date_0");
     }
 
     #[test]
@@ -305,28 +305,28 @@ mod tests {
     #[test]
     fn test_case_insensitive() {
         let r1 = rewrite_query("RETURN GEN_RANDOM_UUID()");
-        assert_eq!(r1.query, "RETURN $_uuid_0");
+        assert_eq!(r1.query, "RETURN $__graphd_uuid_0");
         assert_eq!(r1.generated_params.len(), 1);
 
         let r2 = rewrite_query("RETURN Gen_Random_Uuid()");
-        assert_eq!(r2.query, "RETURN $_uuid_0");
+        assert_eq!(r2.query, "RETURN $__graphd_uuid_0");
         assert_eq!(r2.generated_params.len(), 1);
 
         let r3 = rewrite_query("RETURN CURRENT_TIMESTAMP()");
-        assert_eq!(r3.query, "RETURN $_now_0");
+        assert_eq!(r3.query, "RETURN $__graphd_now_0");
 
         let r4 = rewrite_query("RETURN CURRENT_DATE()");
-        assert_eq!(r4.query, "RETURN $_date_0");
+        assert_eq!(r4.query, "RETURN $__graphd_date_0");
     }
 
     #[test]
     fn test_whitespace_between_name_and_parens() {
         let r = rewrite_query("RETURN gen_random_uuid ()");
-        assert_eq!(r.query, "RETURN $_uuid_0");
+        assert_eq!(r.query, "RETURN $__graphd_uuid_0");
         assert_eq!(r.generated_params.len(), 1);
 
         let r2 = rewrite_query("RETURN gen_random_uuid\t( )");
-        assert_eq!(r2.query, "RETURN $_uuid_0");
+        assert_eq!(r2.query, "RETURN $__graphd_uuid_0");
         assert_eq!(r2.generated_params.len(), 1);
     }
 
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn test_preserves_surrounding_text() {
         let r = rewrite_query("SELECT 1; gen_random_uuid(); SELECT 2");
-        assert_eq!(r.query, "SELECT 1; $_uuid_0; SELECT 2");
+        assert_eq!(r.query, "SELECT 1; $__graphd_uuid_0; SELECT 2");
     }
 
     #[test]
@@ -365,18 +365,18 @@ mod tests {
 
     #[test]
     fn test_merge_params_only_generated() {
-        let gen = vec![("_uuid_0".to_string(), serde_json::json!("abc-123"))];
+        let gen = vec![("__graphd_uuid_0".to_string(), serde_json::json!("abc-123"))];
         let merged = merge_params(None, &gen).unwrap();
-        assert_eq!(merged["_uuid_0"], "abc-123");
+        assert_eq!(merged["__graphd_uuid_0"], "abc-123");
     }
 
     #[test]
     fn test_merge_params_both() {
         let user = serde_json::json!({"name": "Alice"});
-        let gen = vec![("_uuid_0".to_string(), serde_json::json!("abc-123"))];
+        let gen = vec![("__graphd_uuid_0".to_string(), serde_json::json!("abc-123"))];
         let merged = merge_params(Some(&user), &gen).unwrap();
         assert_eq!(merged["name"], "Alice");
-        assert_eq!(merged["_uuid_0"], "abc-123");
+        assert_eq!(merged["__graphd_uuid_0"], "abc-123");
     }
 
     #[test]

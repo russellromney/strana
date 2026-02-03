@@ -69,7 +69,7 @@ impl TokenStore {
 
     /// Returns true if the store has no tokens (open access).
     pub fn is_empty(&self) -> bool {
-        self.tokens.read().unwrap().is_empty()
+        self.tokens.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Hash a plaintext token and add it to the store.
@@ -77,14 +77,14 @@ impl TokenStore {
         let hash = hash_token(plaintext);
         self.tokens
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(hash, label.to_string());
     }
 
     /// Validate a plaintext token. Returns the label if valid.
     /// If the store is empty, all tokens are accepted (returns "open").
     pub fn validate(&self, plaintext: &str) -> Result<String, ()> {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = self.tokens.read().unwrap_or_else(|e| e.into_inner());
         if tokens.is_empty() {
             return Ok("open".to_string());
         }
@@ -100,11 +100,11 @@ pub fn hash_token(plaintext: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Generate a random token: "strana_" + 32 hex chars (128 bits).
+/// Generate a random token: "graphd_" + 32 hex chars (128 bits).
 pub fn generate_token() -> String {
     use rand::Rng;
     let bytes: [u8; 16] = rand::rng().random();
-    format!("strana_{}", hex::encode(bytes))
+    format!("graphd_{}", hex::encode(bytes))
 }
 
 #[cfg(test)]
@@ -145,8 +145,8 @@ mod tests {
     #[test]
     fn test_generate_token_format() {
         let token = generate_token();
-        assert!(token.starts_with("strana_"));
-        assert_eq!(token.len(), 7 + 32); // "strana_" + 32 hex chars
+        assert!(token.starts_with("graphd_"));
+        assert_eq!(token.len(), 7 + 32); // "graphd_" + 32 hex chars
     }
 
     #[test]

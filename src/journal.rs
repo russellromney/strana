@@ -1,10 +1,10 @@
-use crate::wire::proto;
+use crate::graphd as proto;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
@@ -127,6 +127,7 @@ pub struct PendingEntry {
     pub params: Option<serde_json::Value>,
 }
 
+#[allow(dead_code)]
 pub enum JournalCommand {
     Write(PendingEntry),
     Flush(std::sync::mpsc::SyncSender<()>),
@@ -138,25 +139,27 @@ pub type JournalSender = std::sync::mpsc::Sender<JournalCommand>;
 pub struct JournalState {
     pub sequence: AtomicU64,
     pub chain_hash: Mutex<[u8; 32]>,
+    /// Set to false when the journal writer thread exits (crash or shutdown).
+    pub alive: AtomicBool,
 }
 
 impl JournalState {
-    pub fn new() -> Self {
-        Self {
-            sequence: AtomicU64::new(0),
-            chain_hash: Mutex::new([0u8; 32]),
-        }
-    }
-
     pub fn with_sequence_and_hash(seq: u64, hash: [u8; 32]) -> Self {
         Self {
             sequence: AtomicU64::new(seq),
             chain_hash: Mutex::new(hash),
+            alive: AtomicBool::new(true),
         }
+    }
+
+    /// Returns true if the journal writer thread is still running.
+    #[allow(dead_code)]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 }
 
-fn current_timestamp_ms() -> i64 {
+pub fn current_timestamp_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -245,10 +248,42 @@ pub fn spawn_journal_writer(
         .name("journal-writer".into())
         .spawn(move || {
             writer_loop(rx, &journal_dir, segment_max_bytes, fsync_ms, &state);
+            // Mark the writer as dead on exit (normal or panic).
+            state.alive.store(false, Ordering::SeqCst);
         })
         .expect("Failed to spawn journal writer thread");
 
     tx
+}
+
+/// Seal a .graphj segment: rewrite header with SEALED flag + final values.
+fn seal_segment(
+    file: &mut File,
+    first_seq: u64,
+    last_seq: u64,
+    entry_count: u64,
+    body_len: u64,
+    body_hasher: Sha256,
+    created_ms: i64,
+) -> io::Result<()> {
+    let body_checksum: [u8; 32] = body_hasher.finalize().into();
+    let header = crate::graphj::GraphjHeader {
+        flags: crate::graphj::FLAG_SEALED,
+        compression: crate::graphj::COMPRESSION_NONE,
+        encryption: crate::graphj::ENCRYPTION_NONE,
+        zstd_level: 0,
+        first_seq,
+        last_seq,
+        entry_count,
+        body_len,
+        body_checksum,
+        nonce: [0u8; 24],
+        created_ms,
+    };
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&crate::graphj::encode_header(&header))?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn writer_loop(
@@ -260,6 +295,10 @@ fn writer_loop(
 ) {
     let mut current_file: Option<File> = None;
     let mut current_size: u64 = 0;
+    let mut segment_first_seq: u64 = 0;
+    let mut segment_last_seq: u64 = 0;
+    let mut segment_entry_count: u64 = 0;
+    let mut body_hasher: Option<Sha256> = None;
     let timeout = Duration::from_millis(fsync_ms);
 
     loop {
@@ -267,7 +306,7 @@ fn writer_loop(
         match cmd {
             Ok(JournalCommand::Write(entry)) => {
                 // Hold chain lock for the entire compute + write + update cycle.
-                let mut chain = state.chain_hash.lock().unwrap();
+                let mut chain = state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
                 let prev_hash = *chain;
                 let new_seq = state.sequence.load(Ordering::SeqCst) + 1;
 
@@ -290,17 +329,44 @@ fn writer_loop(
                 if current_file.is_none()
                     || current_size + buf.len() as u64 > segment_max_bytes
                 {
+                    // Seal the old segment before rotation.
                     if let Some(ref mut f) = current_file {
-                        if let Err(e) = f.sync_all() {
-                            error!("Journal fsync error on rotation: {e}");
+                        if let Some(hasher) = body_hasher.take() {
+                            let body_len = current_size - crate::graphj::HEADER_SIZE as u64;
+                            if let Err(e) = seal_segment(
+                                f,
+                                segment_first_seq,
+                                segment_last_seq,
+                                segment_entry_count,
+                                body_len,
+                                hasher,
+                                current_timestamp_ms(),
+                            ) {
+                                error!("Failed to seal segment on rotation: {e}");
+                            }
                         }
                     }
-                    let path = journal_dir.join(format!("journal-{new_seq:016}.wal"));
+
+                    // Create new .graphj segment.
+                    let path = journal_dir.join(format!("journal-{new_seq:016}.graphj"));
                     match File::create(&path) {
-                        Ok(f) => {
+                        Ok(mut f) => {
+                            // Write unsealed header.
+                            let header = crate::graphj::GraphjHeader::new_unsealed(
+                                new_seq,
+                                current_timestamp_ms(),
+                            );
+                            if let Err(e) = f.write_all(&crate::graphj::encode_header(&header)) {
+                                error!("Failed to write .graphj header: {e}");
+                                continue;
+                            }
                             info!("Journal: opened segment {}", path.display());
                             current_file = Some(f);
-                            current_size = 0;
+                            current_size = crate::graphj::HEADER_SIZE as u64;
+                            segment_first_seq = new_seq;
+                            segment_last_seq = 0;
+                            segment_entry_count = 0;
+                            body_hasher = Some(Sha256::new());
                         }
                         Err(e) => {
                             error!("Failed to create journal segment: {e}");
@@ -316,11 +382,18 @@ fn writer_loop(
                     continue;
                 }
 
+                // Update body hasher with entry bytes.
+                if let Some(ref mut hasher) = body_hasher {
+                    hasher.update(&buf);
+                }
+
                 // Only update state after successful write.
                 state.sequence.store(new_seq, Ordering::SeqCst);
                 *chain = new_hash;
                 drop(chain);
                 current_size += buf.len() as u64;
+                segment_last_seq = new_seq;
+                segment_entry_count += 1;
             }
             Ok(JournalCommand::Flush(ack)) => {
                 if let Some(ref mut f) = current_file {
@@ -330,7 +403,18 @@ fn writer_loop(
             }
             Ok(JournalCommand::Shutdown) => {
                 if let Some(ref mut f) = current_file {
-                    let _ = f.sync_all();
+                    if let Some(hasher) = body_hasher.take() {
+                        let body_len = current_size - crate::graphj::HEADER_SIZE as u64;
+                        let _ = seal_segment(
+                            f,
+                            segment_first_seq,
+                            segment_last_seq,
+                            segment_entry_count,
+                            body_len,
+                            hasher,
+                            current_timestamp_ms(),
+                        );
+                    }
                 }
                 break;
             }
@@ -341,7 +425,18 @@ fn writer_loop(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if let Some(ref mut f) = current_file {
-                    let _ = f.sync_all();
+                    if let Some(hasher) = body_hasher.take() {
+                        let body_len = current_size - crate::graphj::HEADER_SIZE as u64;
+                        let _ = seal_segment(
+                            f,
+                            segment_first_seq,
+                            segment_last_seq,
+                            segment_entry_count,
+                            body_len,
+                            hasher,
+                            current_timestamp_ms(),
+                        );
+                    }
                 }
                 break;
             }
@@ -351,6 +446,7 @@ fn writer_loop(
 
 // ─── Reader ───
 
+#[allow(dead_code)]
 pub struct JournalReaderEntry {
     pub sequence: u64,
     pub entry: proto::JournalEntry,
@@ -361,14 +457,28 @@ pub struct JournalReader {
     segments: Vec<PathBuf>,
     seg_idx: usize,
     reader: Option<BufReader<File>>,
+    /// For sealed+compressed/encrypted .graphj files, we decode the body into
+    /// memory and read entries from a cursor instead of the file.
+    cursor_reader: Option<io::Cursor<Vec<u8>>>,
     running_hash: [u8; 32],
     start_seq: u64,
+    encryption_key: Option<[u8; 32]>,
 }
 
 impl JournalReader {
     /// Open a journal reader starting from the beginning.
+    #[allow(dead_code)]
     pub fn open(journal_dir: &Path) -> Result<Self, String> {
         Self::from_sequence(journal_dir, 0, [0u8; 32])
+    }
+
+    /// Open a journal reader with an encryption key for sealed .graphj files.
+    #[allow(dead_code)]
+    pub fn open_with_key(
+        journal_dir: &Path,
+        encryption_key: Option<[u8; 32]>,
+    ) -> Result<Self, String> {
+        Self::from_sequence_with_key(journal_dir, 0, [0u8; 32], encryption_key)
     }
 
     /// Open a journal reader starting from a given sequence.
@@ -378,12 +488,23 @@ impl JournalReader {
         start_seq: u64,
         initial_hash: [u8; 32],
     ) -> Result<Self, String> {
+        Self::from_sequence_with_key(journal_dir, start_seq, initial_hash, None)
+    }
+
+    /// Open a journal reader starting from a given sequence with optional encryption key.
+    pub fn from_sequence_with_key(
+        journal_dir: &Path,
+        start_seq: u64,
+        initial_hash: [u8; 32],
+        encryption_key: Option<[u8; 32]>,
+    ) -> Result<Self, String> {
         let mut segments: Vec<PathBuf> = std::fs::read_dir(journal_dir)
             .map_err(|e| format!("Failed to read journal dir: {e}"))?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| {
-                p.extension().map_or(false, |ext| ext == "wal")
+                p.extension()
+                    .map_or(false, |ext| ext == "wal" || ext == "graphj")
                     && p.file_name()
                         .map_or(false, |n| n.to_string_lossy().starts_with("journal-"))
             })
@@ -393,9 +514,100 @@ impl JournalReader {
             segments,
             seg_idx: 0,
             reader: None,
+            cursor_reader: None,
             running_hash: initial_hash,
             start_seq,
+            encryption_key,
         })
+    }
+}
+
+impl JournalReader {
+    /// Process a decoded entry: validate chain, compute hash, decode protobuf.
+    /// Returns Some(Ok(entry)) to yield, Some(Err) on error, None to skip (pre-start).
+    fn process_entry(&mut self, decoded: DecodedEntry) -> Option<Result<JournalReaderEntry, String>> {
+        if decoded.sequence < self.start_seq {
+            let mut hasher = Sha256::new();
+            hasher.update(decoded.prev_hash);
+            hasher.update(&decoded.payload);
+            self.running_hash = hasher.finalize().into();
+            return None; // skip, keep iterating
+        }
+
+        if decoded.prev_hash != self.running_hash {
+            return Some(Err(format!(
+                "Chain hash mismatch at seq {}: expected {:x?}, got {:x?}",
+                decoded.sequence,
+                &self.running_hash[..4],
+                &decoded.prev_hash[..4]
+            )));
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(decoded.prev_hash);
+        hasher.update(&decoded.payload);
+        let new_hash: [u8; 32] = hasher.finalize().into();
+        self.running_hash = new_hash;
+
+        match proto::JournalEntry::decode(decoded.payload.as_slice()) {
+            Ok(entry) => Some(Ok(JournalReaderEntry {
+                sequence: decoded.sequence,
+                entry,
+                chain_hash: new_hash,
+            })),
+            Err(e) => Some(Err(format!(
+                "Failed to decode journal entry at seq {}: {e}",
+                decoded.sequence
+            ))),
+        }
+    }
+
+    /// Open a segment file, detecting format (.graphj vs legacy .wal).
+    /// For sealed+compressed/encrypted .graphj, decodes body into cursor_reader.
+    /// For raw .graphj or legacy .wal, sets up file reader at the right offset.
+    fn open_segment(&mut self, path: &Path) -> Result<(), String> {
+        let mut file = File::open(path)
+            .map_err(|e| format!("Failed to open segment {}: {e}", path.display()))?;
+
+        // Check magic bytes to detect format (only need first 6 bytes).
+        let mut magic_buf = [0u8; 6];
+        let is_graphj = match file.read_exact(&mut magic_buf) {
+            Ok(()) => &magic_buf == crate::graphj::MAGIC,
+            Err(_) => false, // file too small, treat as legacy
+        };
+
+        // Seek back and re-read properly.
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("Failed to seek: {e}"))?;
+
+        if is_graphj {
+            let hdr = crate::graphj::read_header(&mut file)
+                .map_err(|e| format!("Failed to read .graphj header: {e}"))?
+                .ok_or_else(|| "Magic check inconsistency".to_string())?;
+
+            if hdr.is_sealed() && (hdr.is_compressed() || hdr.is_encrypted()) {
+                // Decode entire body into memory.
+                let mut body = vec![0u8; hdr.body_len as usize];
+                file.read_exact(&mut body)
+                    .map_err(|e| format!("Failed to read sealed body: {e}"))?;
+                let raw = crate::graphj::decode_body(
+                    &hdr,
+                    &body,
+                    self.encryption_key.as_ref(),
+                )?;
+                self.cursor_reader = Some(io::Cursor::new(raw));
+                self.reader = None;
+            } else {
+                // Unsealed or sealed-raw: reader is at offset 128 after read_header.
+                self.reader = Some(BufReader::new(file));
+                self.cursor_reader = None;
+            }
+        } else {
+            // Legacy .wal: already at offset 0, read raw entries.
+            self.reader = Some(BufReader::new(file));
+            self.cursor_reader = None;
+        }
+        Ok(())
     }
 }
 
@@ -404,75 +616,55 @@ impl Iterator for JournalReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(ref mut reader) = self.reader {
-                match read_entry_from(reader) {
+            // Try reading from cursor (for decoded sealed .graphj files).
+            if let Some(ref mut cursor) = self.cursor_reader {
+                match read_entry_from(cursor) {
                     Ok(Some(decoded)) => {
-                        if decoded.sequence < self.start_seq {
-                            // Pre-start entry: skip chain validation.
-                            // Fast-forward running_hash using the entry's own stored prev_hash
-                            // so we can validate the connection point when we reach start_seq.
-                            let mut hasher = Sha256::new();
-                            hasher.update(decoded.prev_hash);
-                            hasher.update(&decoded.payload);
-                            self.running_hash = hasher.finalize().into();
-                            continue;
-                        }
-
-                        // At or past start_seq: validate chain normally.
-                        if decoded.prev_hash != self.running_hash {
-                            return Some(Err(format!(
-                                "Chain hash mismatch at seq {}: expected {:x?}, got {:x?}",
-                                decoded.sequence,
-                                &self.running_hash[..4],
-                                &decoded.prev_hash[..4]
-                            )));
-                        }
-
-                        // Compute new chain hash.
-                        let mut hasher = Sha256::new();
-                        hasher.update(decoded.prev_hash);
-                        hasher.update(&decoded.payload);
-                        let new_hash: [u8; 32] = hasher.finalize().into();
-                        self.running_hash = new_hash;
-
-                        // Decode protobuf.
-                        match proto::JournalEntry::decode(decoded.payload.as_slice()) {
-                            Ok(entry) => {
-                                return Some(Ok(JournalReaderEntry {
-                                    sequence: decoded.sequence,
-                                    entry,
-                                    chain_hash: new_hash,
-                                }));
-                            }
-                            Err(e) => {
-                                return Some(Err(format!(
-                                    "Failed to decode journal entry at seq {}: {e}",
-                                    decoded.sequence
-                                )));
-                            }
+                        match self.process_entry(decoded) {
+                            Some(result) => return Some(result),
+                            None => continue, // pre-start, skip
                         }
                     }
                     Ok(None) => {
-                        // EOF on this segment, advance.
-                        self.reader = None;
+                        self.cursor_reader = None;
                         self.seg_idx += 1;
+                        continue;
                     }
                     Err(e) => return Some(Err(e)),
                 }
-            } else {
-                if self.seg_idx >= self.segments.len() {
-                    return None;
+            }
+
+            // Try reading from file reader.
+            if let Some(ref mut reader) = self.reader {
+                match read_entry_from(reader) {
+                    Ok(Some(decoded)) => {
+                        match self.process_entry(decoded) {
+                            Some(result) => return Some(result),
+                            None => continue, // pre-start, skip
+                        }
+                    }
+                    Ok(None) => {
+                        self.reader = None;
+                        self.seg_idx += 1;
+                        continue;
+                    }
+                    Err(e) => return Some(Err(e)),
                 }
-                let path = &self.segments[self.seg_idx];
-                match File::open(path) {
-                    Ok(f) => self.reader = Some(BufReader::new(f)),
-                    Err(e) => {
-                        return Some(Err(format!(
-                            "Failed to open segment {}: {e}",
-                            path.display()
-                        )));
+            }
+
+            // No active reader — open next segment.
+            if self.seg_idx >= self.segments.len() {
+                return None;
+            }
+            let path = self.segments[self.seg_idx].clone();
+            match self.open_segment(&path) {
+                Ok(()) => {
+                    // If open_segment set neither reader, skip this segment.
+                    if self.reader.is_none() && self.cursor_reader.is_none() {
+                        self.seg_idx += 1;
                     }
                 }
+                Err(e) => return Some(Err(e)),
             }
         }
     }
@@ -493,7 +685,8 @@ pub fn recover_journal_state(journal_dir: &Path) -> Result<(u64, [u8; 32]), Stri
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            p.extension().map_or(false, |ext| ext == "wal")
+            p.extension()
+                .map_or(false, |ext| ext == "wal" || ext == "graphj")
                 && p.file_name()
                     .map_or(false, |n| n.to_string_lossy().starts_with("journal-"))
         })
@@ -511,14 +704,34 @@ pub fn recover_journal_state(journal_dir: &Path) -> Result<(u64, [u8; 32]), Stri
     let mut running_hash = [0u8; 32];
 
     for segment_path in &segments {
-        let file = File::open(segment_path)
+        let mut file = File::open(segment_path)
             .map_err(|e| format!("Failed to open segment {}: {e}", segment_path.display()))?;
+
+        // Detect .graphj format and skip header if present.
+        let is_graphj = match crate::graphj::read_header(&mut file) {
+            Ok(Some(_hdr)) => true,  // reader is now at offset 128
+            Ok(None) => {
+                // Legacy .wal — seek back to 0.
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|e| format!("Failed to seek: {e}"))?;
+                false
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                error!(
+                    "Skipping corrupted .graphj file (truncated header): {}",
+                    segment_path.display()
+                );
+                continue;
+            }
+            Err(e) => return Err(format!("Failed to read {}: {e}", segment_path.display())),
+        };
+        let _ = is_graphj; // used for clarity, reader position is what matters
+
         let mut reader = BufReader::new(file);
 
         loop {
             match read_entry_from(&mut reader) {
                 Ok(Some(decoded)) => {
-                    // Compute chain hash for this entry
                     let mut hasher = Sha256::new();
                     hasher.update(decoded.prev_hash);
                     hasher.update(&decoded.payload);
@@ -691,7 +904,7 @@ mod tests {
     fn test_write_read_roundtrip_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         let tx = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state.clone());
 
@@ -726,7 +939,7 @@ mod tests {
     fn test_chain_hash_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         let tx = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state.clone());
 
@@ -759,12 +972,12 @@ mod tests {
     fn test_segment_rotation() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         // Very small segment size to force rotation.
         let tx = spawn_journal_writer(journal_dir.clone(), 100, 100, state.clone());
 
-        for i in 1..=5 {
+        for _ in 1..=5 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("CREATE (:Big {{data: '{}'}})", "x".repeat(50)),
                 params: None,
@@ -782,7 +995,7 @@ mod tests {
         let segments: Vec<_> = std::fs::read_dir(&journal_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "wal"))
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "graphj"))
             .collect();
         assert!(
             segments.len() > 1,
@@ -803,7 +1016,7 @@ mod tests {
     fn test_segment_naming() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         let tx = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state.clone());
 
@@ -825,7 +1038,7 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0], "journal-0000000000000001.wal");
+        assert_eq!(files[0], "journal-0000000000000001.graphj");
     }
 
     #[test]
@@ -843,7 +1056,7 @@ mod tests {
     fn test_read_from_sequence() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         let tx = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state.clone());
 
@@ -874,7 +1087,7 @@ mod tests {
     fn test_journal_with_params() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         let tx = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state.clone());
 
@@ -902,7 +1115,7 @@ mod tests {
     fn test_state_sequence_progresses() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         let tx = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state.clone());
 
@@ -960,7 +1173,7 @@ mod tests {
     fn test_recover_state_from_existing_journal() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         let tx = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state.clone());
 
@@ -981,7 +1194,7 @@ mod tests {
 
         // Record expected state.
         let expected_seq = state.sequence.load(Ordering::SeqCst);
-        let expected_hash = *state.chain_hash.lock().unwrap();
+        let expected_hash = *state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
 
         // Recover and compare.
         let (rec_seq, rec_hash) = recover_journal_state(&journal_dir).unwrap();
@@ -995,12 +1208,12 @@ mod tests {
     fn test_recover_state_multiple_segments() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         // Small segment size to force rotation.
         let tx = spawn_journal_writer(journal_dir.clone(), 100, 100, state.clone());
 
-        for i in 1..=5 {
+        for _ in 1..=5 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("CREATE (:Big {{data: '{}'}})", "x".repeat(50)),
                 params: None,
@@ -1018,12 +1231,12 @@ mod tests {
         let seg_count = std::fs::read_dir(&journal_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "wal"))
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "graphj"))
             .count();
         assert!(seg_count > 1, "Expected multiple segments, got {seg_count}");
 
         let expected_seq = state.sequence.load(Ordering::SeqCst);
-        let expected_hash = *state.chain_hash.lock().unwrap();
+        let expected_hash = *state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
 
         let (rec_seq, rec_hash) = recover_journal_state(&journal_dir).unwrap();
         assert_eq!(rec_seq, expected_seq);
@@ -1036,7 +1249,7 @@ mod tests {
         let journal_dir = dir.path().join("journal");
 
         // Phase 1: Write entries, shutdown.
-        let state1 = Arc::new(JournalState::new());
+        let state1 = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
         let tx1 = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state1.clone());
 
         for i in 1..=3 {
@@ -1118,7 +1331,7 @@ mod tests {
     fn test_read_after_compaction() {
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
-        let state = Arc::new(JournalState::new());
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
 
         // Small segment size to force rotation across multiple segments.
         let tx = spawn_journal_writer(journal_dir.clone(), 100, 100, state.clone());

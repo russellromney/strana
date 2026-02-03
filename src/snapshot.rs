@@ -3,7 +3,7 @@ use crate::journal::{
     self, JournalCommand, JournalReader, JournalSender, JournalState,
 };
 use crate::values::json_params_to_lbug;
-use crate::wire::proto;
+use crate::graphd as proto;
 use prost::Message;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 // ─── Types ───
 
+#[allow(dead_code)]
 pub struct SnapshotInfo {
     pub sequence: u64,
     pub chain_hash: [u8; 32],
@@ -26,6 +27,7 @@ pub struct RetentionConfig {
     pub monthly: usize,
 }
 
+#[allow(dead_code)]
 struct SnapshotEntry {
     path: PathBuf,
     sequence: u64,
@@ -89,7 +91,7 @@ pub fn create_snapshot(
 
     // 2. Read journal state (sequence + chain hash).
     let sequence = journal_state.sequence.load(Ordering::SeqCst);
-    let chain_hash = *journal_state.chain_hash.lock().unwrap();
+    let chain_hash = *journal_state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
 
     // 3. CHECKPOINT the database to flush its WAL.
     let conn = db.connection()?;
@@ -175,7 +177,11 @@ fn find_latest_snapshot(data_dir: &Path) -> Result<PathBuf, String> {
 /// If `snapshot_path` is None, the latest snapshot is used.
 /// After restoring the snapshot's data files, journal entries with sequence
 /// greater than the snapshot's sequence are replayed in order.
-pub fn restore(data_dir: &Path, snapshot_path: Option<&Path>) -> Result<(), String> {
+pub fn restore(
+    data_dir: &Path,
+    snapshot_path: Option<&Path>,
+    encryption_key: Option<[u8; 32]>,
+) -> Result<(), String> {
     let snap_dir = match snapshot_path {
         Some(p) => p.to_path_buf(),
         None => find_latest_snapshot(data_dir)?,
@@ -195,7 +201,10 @@ pub fn restore(data_dir: &Path, snapshot_path: Option<&Path>) -> Result<(), Stri
         snap_dir.display()
     );
 
-    // 1. Remove old DB if present (may be file or directory).
+    // 1. Remove old DB and WAL if present.
+    //    LadybugDB stores a WAL at db.wal alongside the main db file/dir.
+    //    If stale WAL entries remain, they'll be replayed on open, corrupting
+    //    the restored snapshot with post-snapshot data.
     let db_path = data_dir.join("db");
     if db_path.is_dir() {
         std::fs::remove_dir_all(&db_path)
@@ -203,6 +212,11 @@ pub fn restore(data_dir: &Path, snapshot_path: Option<&Path>) -> Result<(), Stri
     } else if db_path.exists() {
         std::fs::remove_file(&db_path)
             .map_err(|e| format!("Failed to remove old db file: {e}"))?;
+    }
+    let wal_path = data_dir.join("db.wal");
+    if wal_path.exists() {
+        std::fs::remove_file(&wal_path)
+            .map_err(|e| format!("Failed to remove old WAL: {e}"))?;
     }
 
     // 2. Copy snapshot data to data_dir/db.
@@ -223,7 +237,12 @@ pub fn restore(data_dir: &Path, snapshot_path: Option<&Path>) -> Result<(), Stri
 
         // Use the snapshot's chain hash so the reader can validate entries even
         // after journal compaction has deleted old segments.
-        let reader = JournalReader::from_sequence(&journal_dir, snap_seq + 1, snap_hash)?;
+        let reader = JournalReader::from_sequence_with_key(
+            &journal_dir,
+            snap_seq + 1,
+            snap_hash,
+            encryption_key,
+        )?;
         let mut replayed = 0u64;
         let mut skipped = 0u64;
 
@@ -439,6 +458,10 @@ fn list_snapshots(snapshots_dir: &Path) -> Result<Vec<SnapshotEntry>, String> {
 /// Parse the starting sequence number from a journal segment filename.
 /// Expected format: `journal-{seq:016}.wal`
 fn parse_segment_start_seq(path: &Path) -> Option<u64> {
+    let ext = path.extension()?.to_str()?;
+    if ext != "wal" && ext != "graphj" {
+        return None;
+    }
     let name = path.file_stem()?.to_string_lossy();
     let seq_str = name.strip_prefix("journal-")?;
     seq_str.parse().ok()

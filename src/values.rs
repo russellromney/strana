@@ -9,7 +9,7 @@ pub struct InternalId {
     pub offset: u64,
 }
 
-/// A value returned from a Cypher query, encoded per the Strana protocol spec.
+/// A value returned from a Cypher query, encoded as JSON per Neo4j HTTP API spec.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum GraphValue {
@@ -49,7 +49,7 @@ pub enum TaggedValue {
     },
 }
 
-/// Convert a LadybugDB Value into a Strana GraphValue.
+/// Convert a LadybugDB Value into a GraphValue for JSON serialization.
 pub fn from_lbug_value(value: &lbug::Value) -> GraphValue {
     match value {
         lbug::Value::Null(_) => GraphValue::Null,
