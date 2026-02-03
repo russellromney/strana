@@ -1,0 +1,13 @@
+[package]
+name = "graphd-e2e-rust"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "test_rust"
+path = "test_rust.rs"
+
+[dependencies]
+neo4rs = "0.6"
+tokio = { version = "1", features = ["full"] }

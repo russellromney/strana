@@ -1,0 +1,12 @@
+{
+  "name": "graphd-e2e-js",
+  "version": "1.0.0",
+  "description": "JavaScript Neo4j driver compatibility tests for graphd",
+  "private": true,
+  "scripts": {
+    "test": "node test_js.js"
+  },
+  "dependencies": {
+    "neo4j-driver": "^5.27.0"
+  }
+}

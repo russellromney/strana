@@ -3,3 +3,10 @@
 /kuzu-lib
 /kuzu-patched
 .env*
+
+# E2E test dependencies
+tests/e2e/node_modules/
+tests/e2e/package-lock.json
+tests/e2e/go.sum
+tests/e2e/target/
+tests/e2e/Cargo.lock

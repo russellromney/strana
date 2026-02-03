@@ -1,20 +1,51 @@
 # graphd
 
-**Neo4j-compatible graph database server powered by embedded [LadybugDB](https://ladybugdb.com/) (formerly Kuzu)**.
+Neo4j-compatible graph database server powered by embedded LadybugDB (formerly Kuzu).
 
-`graphd` exposes LadybugDB (formerly Kuzu) over the network with Neo4j's Bolt protocol and HTTP API. Use existing Neo4j drivers and tools, backed by a fast embedded graph database with built-in journaling, snapshots, and S3 backups.
-
-Think [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) for graph databases — a server that makes embedded databases accessible over the network.
+Exposes LadybugDB over Bolt 4.4 and Neo4j HTTP API. Adds journaling, point-in-time recovery, and S3 backups via new `.graphj` format. Think [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) for graph databases.
 
 ## Features
 
 - **Neo4j-compatible**: Bolt 4.4 protocol + Neo4j HTTP API
-- **Fast embedded backend**: LadybugDB with 256MB default buffer pool
-- **Write-ahead journaling**: GraphJ format with CRC32C + SHA-256 chain hashing
+- **Fast embedded backend**: LadybugDB (formerly Kuzu)
+- **Logical replication**: GraphJ format with CRC32C + SHA-256 chain hashing
 - **Point-in-time recovery**: Snapshots + journal replay
 - **Compression & encryption**: zstd + XChaCha20-Poly1305 for compacted archives
 - **S3-compatible backups**: Tigris, R2, Wasabi, MinIO, etc.
 - **Token authentication**: SHA-256 hashed multi-token support
+
+## Architecture
+
+```
+┌─────────────────────────────────────┐
+│  Neo4j Drivers (Python, JS, Go...)  │
+└──────────────┬──────────────────────┘
+               │ Bolt 4.4 / HTTP
+┌──────────────▼──────────────────────┐
+│          graphd (Rust)               │
+│  ┌────────────────────────────────┐ │
+│  │  Bolt Server + Neo4j HTTP API  │ │
+│  └────────────┬───────────────────┘ │
+│  ┌────────────▼───────────────────┐ │
+│  │    Query Rewriter (non-det)    │ │
+│  └────────────┬───────────────────┘ │
+│  ┌────────────▼───────────────────┐ │
+│  │   Journal Writer (.graphj)     │ │
+│  └────────────┬───────────────────┘ │
+│  ┌────────────▼───────────────────┐ │
+│  │  LadybugDB (embedded Kuzu)     │ │
+│  └────────────────────────────────┘ │
+└─────────────────────────────────────┘
+         │                  │
+         ▼                  ▼
+    data/db/          data/journal/
+  (LadybugDB)         (.graphj files)
+```
+
+## Requirements
+
+- Linux or macOS (Windows via WSL)
+- Rust 1.70+
 
 ## Install
 
@@ -30,7 +61,7 @@ cargo build --release
 ## Quick start
 
 ```bash
-graphd --data-dir ./my-graph
+graphd --data-dir ./my-graph --token my-secret-token
 ```
 
 `graphd` is now listening on Bolt port `7687` and HTTP port `7688`. Connect with any Neo4j driver:
@@ -38,10 +69,15 @@ graphd --data-dir ./my-graph
 ```python
 from neo4j import GraphDatabase
 
-driver = GraphDatabase.driver("bolt://localhost:7687")
+# Connect with authentication
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "my-secret-token"))
+
+# Use explicit transactions for bulk writes (7-10x faster than auto-commit)
 with driver.session() as session:
-    result = session.run("CREATE (n:Person {name: $name}) RETURN n", name="Alice")
-    print(result.single())
+    with session.begin_transaction() as tx:
+        for i in range(100):
+            tx.run("CREATE (n:Person {id: $id, name: $name})", id=i, name=f"Person{i}")
+        tx.commit()
 ```
 
 ## Usage
@@ -106,7 +142,10 @@ graphd --token my-secret-token
 # With journaling + compression
 graphd --journal --journal-compress
 
-# With S3 snapshots
+# With S3 snapshots (requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION env vars)
+export AWS_ACCESS_KEY_ID=your-key
+export AWS_SECRET_ACCESS_KEY=your-secret
+export AWS_REGION=us-east-1
 graphd --journal \
   --s3-bucket my-snapshots \
   --s3-prefix prod/ \
@@ -121,7 +160,7 @@ graphd --restore --s3-bucket my-snapshots
 
 ### Bolt Protocol
 
-`graphd` implements Bolt 4.4. Use any Neo4j driver:
+`graphd` implements Bolt 4.4 (see [src/bolt/](src/bolt/) for protocol implementation). Use any Neo4j driver:
 
 ```python
 # Python
@@ -143,7 +182,7 @@ driver, _ := neo4j.NewDriverWithContext("bolt://localhost:7687", neo4j.BasicAuth
 
 ### HTTP API
 
-Neo4j HTTP endpoints (port 7688 by default):
+Neo4j HTTP endpoints (see [src/http/](src/http/) for HTTP API implementation, port 7688 by default):
 
 ```bash
 # Execute query
@@ -224,6 +263,15 @@ graphd --restore --data-dir ./data
 graphd --snapshot --s3-bucket my-backups
 ```
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for planned features including:
+- Schema inference (auto-DDL)
+- Serverless SDKs (Python/Node)
+- Additional AI memory framework verification (Cognee)
+- MCP server for LLM integration
+- Embedded read replicas via S3
+
 ## Performance
 
 Benchmark results from `cargo bench` (Apple Silicon M1):
@@ -251,8 +299,14 @@ See [`benches/README.md`](benches/README.md) for full benchmark documentation.
 # Unit + integration tests
 make test
 
-# End-to-end tests with Neo4j Python driver
-make e2e
+# Driver compatibility tests
+make e2e         # Python integration (default, comprehensive)
+make e2e-py      # Python integration tests
+make e2e-python  # Python standalone driver tests
+make e2e-js      # JavaScript driver tests
+make e2e-go      # Go driver tests
+make e2e-rust    # Rust driver tests (Bolt 5.x pending)
+make e2e-all     # All driver tests
 
 # Benchmarks
 make bench
@@ -277,43 +331,6 @@ make e2e
 # Benchmark
 make bench
 ```
-
-## Architecture
-
-```
-┌─────────────────────────────────────┐
-│  Neo4j Drivers (Python, JS, Go...)  │
-└──────────────┬──────────────────────┘
-               │ Bolt 4.4 / HTTP
-┌──────────────▼──────────────────────┐
-│          graphd (Rust)               │
-│  ┌────────────────────────────────┐ │
-│  │  Bolt Server + Neo4j HTTP API  │ │
-│  └────────────┬───────────────────┘ │
-│  ┌────────────▼───────────────────┐ │
-│  │    Query Rewriter (non-det)    │ │
-│  └────────────┬───────────────────┘ │
-│  ┌────────────▼───────────────────┐ │
-│  │   Journal Writer (.graphj)     │ │
-│  └────────────┬───────────────────┘ │
-│  ┌────────────▼───────────────────┐ │
-│  │  LadybugDB (embedded Kuzu)     │ │
-│  └────────────────────────────────┘ │
-└─────────────────────────────────────┘
-         │                  │
-         ▼                  ▼
-    data/db/          data/journal/
-  (LadybugDB)         (.graphj files)
-```
-
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) for planned features including:
-- Schema inference (auto-DDL)
-- Embedded SDKs (Python/Node)
-- Additional AI memory framework verification (Cognee)
-- MCP server for LLM integration
-- Embedded read replicas via S3
 
 ## Changelog
 
