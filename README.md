@@ -1,6 +1,6 @@
 # graphd
 
-**Neo4j-compatible graph database server powered by embedded [LadybugDB](https://ladybugdb.com/).**
+**Neo4j-compatible graph database server powered by embedded [LadybugDB](https://ladybugdb.com/) (formerly Kuzu)**.
 
 `graphd` exposes LadybugDB (formerly Kuzu) over the network with Neo4j's Bolt protocol and HTTP API. Use existing Neo4j drivers and tools, backed by a fast embedded graph database with built-in journaling, snapshots, and S3 backups.
 
@@ -33,12 +33,12 @@ cargo build --release
 graphd --data-dir ./my-graph
 ```
 
-`graphd` is now listening on `127.0.0.1:7688`. Connect with any Neo4j driver:
+`graphd` is now listening on Bolt port `7687` and HTTP port `7688`. Connect with any Neo4j driver:
 
 ```python
 from neo4j import GraphDatabase
 
-driver = GraphDatabase.driver("bolt://localhost:7688")
+driver = GraphDatabase.driver("bolt://localhost:7687")
 with driver.session() as session:
     result = session.run("CREATE (n:Person {name: $name}) RETURN n", name="Alice")
     print(result.single())
@@ -54,10 +54,14 @@ graphd [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-p, --port` | `7688` | Port for Bolt protocol |
-| `--http-port` | `7474` | Port for HTTP API (Neo4j-compatible) |
-| `--host` | `127.0.0.1` | Bind address |
+| `--bolt-port` | `7687` | Port for Bolt protocol |
+| `--bolt-host` | `127.0.0.1` | Bolt bind address |
+| `--http-port` | `7688` | Port for HTTP API (Neo4j-compatible) |
+| `--http-host` | `127.0.0.1` | HTTP bind address |
 | `-d, --data-dir` | `./data` | Database directory |
+| `--tx-timeout-secs` | `30` | HTTP transaction timeout in seconds |
+| `--bolt-max-connections` | `256` | Maximum concurrent Bolt connections |
+| `--read-connections` | `4` | Number of concurrent read connections in pool |
 
 ### Authentication
 
@@ -82,13 +86,13 @@ graphd [OPTIONS]
 
 | Flag | Description |
 |------|-------------|
-| `--snapshot` | Create snapshot on startup, then exit |
-| `--restore` | Restore from latest snapshot + replay journal, then start |
-| `--s3-bucket` | S3 bucket name for snapshot uploads |
-| `--s3-prefix` | S3 key prefix (default: `backups/`) |
+| `--restore` | Restore from latest snapshot + replay journal, then exit |
+| `--snapshot <PATH>` | Optional: specific snapshot directory for `--restore` |
+| `--s3-bucket` | S3 bucket name for snapshot downloads/uploads |
+| `--s3-prefix` | S3 key prefix (default: `""`) |
 | `--retain-daily` | Keep N daily snapshots (default: 7) |
 | `--retain-weekly` | Keep N weekly snapshots (default: 4) |
-| `--retain-monthly` | Keep N monthly snapshots (default: 12) |
+| `--retain-monthly` | Keep N monthly snapshots (default: 3) |
 
 ### Examples
 
@@ -122,34 +126,34 @@ graphd --restore --s3-bucket my-snapshots
 ```python
 # Python
 from neo4j import GraphDatabase
-driver = GraphDatabase.driver("bolt://localhost:7688", auth=("neo4j", "your-token"))
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "your-token"))
 ```
 
 ```javascript
 // JavaScript/TypeScript
 const neo4j = require('neo4j-driver');
-const driver = neo4j.driver('bolt://localhost:7688', neo4j.auth.basic('neo4j', 'your-token'));
+const driver = neo4j.driver('bolt://localhost:7687', neo4j.auth.basic('neo4j', 'your-token'));
 ```
 
 ```go
 // Go
 import "github.com/neo4j/neo4j-go-driver/v5/neo4j"
-driver, _ := neo4j.NewDriverWithContext("bolt://localhost:7688", neo4j.BasicAuth("neo4j", "your-token", ""))
+driver, _ := neo4j.NewDriverWithContext("bolt://localhost:7687", neo4j.BasicAuth("neo4j", "your-token", ""))
 ```
 
 ### HTTP API
 
-Neo4j HTTP endpoints (port 7474 by default):
+Neo4j HTTP endpoints (port 7688 by default):
 
 ```bash
 # Execute query
-curl -X POST http://localhost:7474/db/neo4j/tx/commit \
+curl -X POST http://localhost:7688/db/neo4j/tx/commit \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-token" \
   -d '{"statements": [{"statement": "CREATE (n:Person {name: $name}) RETURN n", "parameters": {"name": "Alice"}}]}'
 
 # Transaction (begin, execute, commit)
-curl -X POST http://localhost:7474/db/neo4j/tx \
+curl -X POST http://localhost:7688/db/neo4j/tx \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-token" \
   -d '{"statements": [{"statement": "CREATE (n:Person {name: $name})", "parameters": {"name": "Bob"}}]}'
