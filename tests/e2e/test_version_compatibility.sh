@@ -1,11 +1,29 @@
 #!/bin/bash
 # E2E test runner for Bolt protocol version compatibility
 #
-# This script runs e2e tests with different BOLT_MAX_VERSION settings
-# to verify that graphd works correctly with clients at each protocol level.
+# This script runs the COMPLETE e2e test suite with different BOLT_MAX_VERSION
+# settings to verify that graphd works correctly at each Bolt protocol level.
+#
+# IMPORTANT: This tests the full protocol implementation, not just the handshake.
+# Each test run includes:
+#   - Connection handshake and authentication
+#   - Query execution (CREATE, MATCH, WHERE, etc.)
+#   - Transaction handling (BEGIN, COMMIT, ROLLBACK)
+#   - Error handling and reporting (version-specific formats)
+#   - Result streaming and data type conversions
+#   - Connection hints (for Bolt 5.4+)
+#   - All 298 e2e tests in test_e2e.py
+#
+# The BOLT_MAX_VERSION environment variable causes the server to artificially
+# limit its negotiated version, allowing us to test version-specific behavior
+# without needing multiple client implementations.
+#
+# The e2e tests (test_e2e.py) start their own server instance with the
+# BOLT_MAX_VERSION variable set, so we just need to export it.
 #
 # Usage:
 #   ./tests/e2e/test_version_compatibility.sh
+#   make version-compat  # Recommended
 
 set -e
 
@@ -32,11 +50,23 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Track results
-declare -a RESULTS
+# Track results (parallel arrays for bash 3.2 compatibility)
+RESULT_VERSIONS=()
+RESULT_STATUS=()
 TOTAL_TESTS=${#VERSIONS[@]}
 PASSED=0
 FAILED=0
+
+# Clean up any running servers
+cleanup() {
+    echo "Cleaning up..."
+    make down 2>/dev/null || true
+    pkill -f "graphd" 2>/dev/null || true
+    rm -rf /tmp/graphd_test_* 2>/dev/null || true
+}
+
+# Trap to ensure cleanup on exit
+trap cleanup EXIT
 
 # Function to run tests with a specific version limit
 run_version_test() {
@@ -46,44 +76,38 @@ run_version_test() {
     echo -e "${YELLOW}Testing with Bolt $version${NC}"
     echo "======================================================"
 
-    # Start server with version limit
-    echo "Starting graphd with BOLT_MAX_VERSION=$version..."
-    BOLT_MAX_VERSION=$version make up &
-    SERVER_PID=$!
+    # Export the version limit for the e2e test to pick up
+    export BOLT_MAX_VERSION=$version
 
-    # Wait for server to be ready
-    sleep 3
+    # Run Python e2e tests (they start their own server)
+    echo "Running e2e tests with BOLT_MAX_VERSION=$version..."
+    local log_file="/tmp/graphd_e2e_${version//./}.log"
 
-    # Check if server is running
-    if ! kill -0 $SERVER_PID 2>/dev/null; then
-        echo -e "${RED}✗ Server failed to start${NC}"
-        RESULTS[$version]="FAILED_START"
-        FAILED=$((FAILED + 1))
-        return 1
-    fi
-
-    # Run Python e2e tests
-    echo "Running e2e tests..."
-    if make e2e-py > /tmp/graphd_e2e_${version}.log 2>&1; then
+    if make e2e-py > "$log_file" 2>&1; then
         echo -e "${GREEN}✓ Bolt $version tests PASSED${NC}"
-        RESULTS[$version]="PASSED"
+        RESULT_VERSIONS+=("$version")
+        RESULT_STATUS+=("PASSED")
         PASSED=$((PASSED + 1))
     else
         echo -e "${RED}✗ Bolt $version tests FAILED${NC}"
-        echo "See /tmp/graphd_e2e_${version}.log for details"
-        RESULTS[$version]="FAILED_TESTS"
+        echo "See $log_file for details"
+        echo "Last 20 lines of log:"
+        tail -20 "$log_file" | sed 's/^/  /'
+        RESULT_VERSIONS+=("$version")
+        RESULT_STATUS+=("FAILED_TESTS")
         FAILED=$((FAILED + 1))
     fi
 
-    # Stop server
-    echo "Stopping graphd..."
-    make down || true
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
+    # Unset for next iteration
+    unset BOLT_MAX_VERSION
 
-    # Give it a moment to fully shut down
+    # Brief pause between tests
     sleep 1
 }
+
+# Build first
+echo "Building graphd..."
+make build
 
 # Run tests for each version
 for version in "${VERSIONS[@]}"; do
@@ -99,8 +123,9 @@ echo ""
 printf "%-10s %s\n" "Version" "Result"
 printf "%-10s %s\n" "-------" "------"
 
-for version in "${VERSIONS[@]}"; do
-    result="${RESULTS[$version]}"
+for i in "${!RESULT_VERSIONS[@]}"; do
+    version="${RESULT_VERSIONS[$i]}"
+    result="${RESULT_STATUS[$i]}"
     if [[ "$result" == "PASSED" ]]; then
         printf "%-10s ${GREEN}%s${NC}\n" "$version" "$result"
     else

@@ -1,4 +1,4 @@
-.PHONY: setup-lbug test build clean help e2e e2e-py e2e-python e2e-js e2e-go e2e-rust e2e-all bench
+.PHONY: setup-lbug test build clean help e2e e2e-py e2e-python e2e-js e2e-go e2e-rust e2e-all bench up down logs status version-compat
 
 LBUG_VERSION := v0.14.1
 LBUG_ARCHIVE := liblbug-osx-universal.tar.gz
@@ -75,3 +75,68 @@ clean: ## Clean build artifacts
 
 bench: ## Run benchmarks
 	DYLD_LIBRARY_PATH=$(CURDIR)/lbug-lib ~/.cargo/bin/cargo bench
+
+up: build ## Start graphd server in background
+	@echo "Starting graphd server..."
+	@mkdir -p /tmp/graphd
+	@DYLD_LIBRARY_PATH=$(CURDIR)/lbug-lib \
+		$(CURDIR)/target/debug/graphd \
+		--data-dir /tmp/graphd/data \
+		> /tmp/graphd/server.log 2>&1 & echo $$! > /tmp/graphd/server.pid
+	@sleep 2
+	@if kill -0 $$(cat /tmp/graphd/server.pid 2>/dev/null) 2>/dev/null; then \
+		echo "✓ Server started (PID: $$(cat /tmp/graphd/server.pid))"; \
+		echo "  Bolt: bolt://localhost:7687"; \
+		echo "  HTTP: http://localhost:7474"; \
+		echo "  Logs: /tmp/graphd/server.log"; \
+	else \
+		echo "✗ Server failed to start. Check /tmp/graphd/server.log"; \
+		exit 1; \
+	fi
+
+down: ## Stop graphd server
+	@if [ -f /tmp/graphd/server.pid ]; then \
+		PID=$$(cat /tmp/graphd/server.pid); \
+		if kill -0 $$PID 2>/dev/null; then \
+			echo "Stopping graphd server (PID: $$PID)..."; \
+			kill $$PID; \
+			sleep 1; \
+			if kill -0 $$PID 2>/dev/null; then \
+				echo "Force killing..."; \
+				kill -9 $$PID 2>/dev/null || true; \
+			fi; \
+			echo "✓ Server stopped"; \
+		else \
+			echo "Server not running (stale PID file)"; \
+		fi; \
+		rm -f /tmp/graphd/server.pid; \
+	else \
+		echo "Server not running (no PID file)"; \
+	fi
+
+logs: ## Show server logs
+	@if [ -f /tmp/graphd/server.log ]; then \
+		tail -f /tmp/graphd/server.log; \
+	else \
+		echo "No log file found at /tmp/graphd/server.log"; \
+	fi
+
+status: ## Check server status
+	@if [ -f /tmp/graphd/server.pid ]; then \
+		PID=$$(cat /tmp/graphd/server.pid); \
+		if kill -0 $$PID 2>/dev/null; then \
+			echo "✓ Server running (PID: $$PID)"; \
+			echo "  Bolt: bolt://localhost:7687"; \
+			echo "  HTTP: http://localhost:7474"; \
+		else \
+			echo "✗ Server not running (stale PID file)"; \
+		fi; \
+	else \
+		echo "✗ Server not running"; \
+	fi
+
+version-compat: build ## Run version compatibility tests across all Bolt versions
+	@# Tests full protocol implementation (not just handshake) at each Bolt version
+	@# by setting BOLT_MAX_VERSION environment variable. Runs complete e2e test suite
+	@# for Bolt 4.4, 5.0, 5.1, 5.4, and 5.7 to verify version-specific features.
+	@./tests/e2e/test_version_compatibility.sh

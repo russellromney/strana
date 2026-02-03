@@ -2,6 +2,22 @@
 ///
 /// These tests verify that version-specific features are correctly implemented
 /// for each supported Bolt protocol version (4.4, 5.0-5.7).
+///
+/// ## Version Limiting for Testing
+///
+/// The `negotiate_bolt_version_with_limit()` function allows artificially constraining
+/// version negotiation via the BOLT_MAX_VERSION environment variable. This enables
+/// testing the complete protocol implementation (not just handshake) at each version:
+///
+/// ```bash
+/// BOLT_MAX_VERSION=5.0 make e2e-py  # Run all e2e tests at Bolt 5.0
+/// make version-compat               # Test all versions (4.4, 5.0, 5.1, 5.4, 5.7)
+/// ```
+///
+/// This approach allows verification of version-specific features like:
+/// - Connection hints (telemetry.enabled for 5.4+)
+/// - Error formats (legacy vs GQL-compliant for 5.7)
+/// - Protocol behavior across different client versions
 
 use graphd::bolt::{add_connection_hints, failure_message_versioned, BoltVersion};
 use bolt_proto::Value;

@@ -919,11 +919,29 @@ pub fn add_connection_hints(bolt_version: BoltVersion, metadata: &mut HashMap<St
 
 // ─── Bolt version negotiation ───
 
-/// Get maximum Bolt version from environment (for testing).
+/// Get maximum Bolt version from environment (for version compatibility testing).
 ///
-/// Set BOLT_MAX_VERSION to limit negotiation (e.g., "4.4", "5.0", "5.7").
-/// This allows testing with older protocol versions by artificially limiting
-/// what the server will negotiate.
+/// Set BOLT_MAX_VERSION to artificially limit version negotiation (e.g., "4.4", "5.0", "5.7").
+///
+/// This allows testing the full protocol implementation at each Bolt version level,
+/// not just the handshake. When set, the server will negotiate down to the specified
+/// version and use version-appropriate features:
+///
+/// - Bolt 4.4: Legacy error format, no connection hints
+/// - Bolt 5.0-5.3: Legacy error format, no connection hints
+/// - Bolt 5.4-5.6: Legacy error format, telemetry.enabled hint
+/// - Bolt 5.7: GQL-compliant error format, telemetry.enabled hint
+///
+/// Usage:
+/// ```bash
+/// BOLT_MAX_VERSION=5.0 ./graphd
+/// BOLT_MAX_VERSION=4.4 make e2e-py
+/// make version-compat  # Test all versions automatically
+/// ```
+///
+/// This is particularly useful for verifying compatibility with clients that
+/// only support older Bolt versions, or for testing version-specific protocol
+/// features without needing multiple client implementations.
 fn get_max_bolt_version_from_env() -> Option<BoltVersion> {
     std::env::var("BOLT_MAX_VERSION").ok().and_then(|s| {
         let parts: Vec<&str> = s.split('.').collect();
@@ -953,6 +971,9 @@ fn get_max_bolt_version_from_env() -> Option<BoltVersion> {
 /// Prefers the highest supported version up to the limit.
 ///
 /// Supports Bolt 4.4 and Bolt 5.0-5.7.
+///
+/// The `max_version` parameter allows artificially limiting negotiation for testing.
+/// See `get_max_bolt_version_from_env()` for details on the BOLT_MAX_VERSION feature.
 #[cfg_attr(test, allow(dead_code))]
 pub fn negotiate_bolt_version_with_limit(
     versions: &[u8; 16],
