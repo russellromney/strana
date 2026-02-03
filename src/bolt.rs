@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 /// Bolt protocol version negotiated with the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BoltVersion {
+pub enum BoltVersion {
     V4_4,
     /// Bolt 5.x where the u8 is the minor version (0-7 for Bolt 5.0-5.7)
     V5(u8),
@@ -733,7 +733,8 @@ fn failure_message(code: &str, message: &str) -> Vec<Bytes> {
 /// - Returns `gql_status` (GQL standard status identifier)
 /// - Returns `description` (human-readable description)
 /// - Can include `diagnostic_record` for additional context
-fn failure_message_versioned(bolt_version: BoltVersion, code: &str, message: &str) -> Vec<Bytes> {
+#[cfg_attr(test, allow(dead_code))]
+pub fn failure_message_versioned(bolt_version: BoltVersion, code: &str, message: &str) -> Vec<Bytes> {
     let mut metadata = HashMap::new();
 
     match bolt_version {
@@ -890,7 +891,8 @@ fn extract_credentials(metadata: &HashMap<String, Value>) -> Option<&str> {
 ///
 /// Connection hints inform the client about server capabilities and are introduced
 /// in specific Bolt protocol versions.
-fn add_connection_hints(bolt_version: BoltVersion, metadata: &mut HashMap<String, Value>) {
+#[cfg_attr(test, allow(dead_code))]
+pub fn add_connection_hints(bolt_version: BoltVersion, metadata: &mut HashMap<String, Value>) {
     // Hints map (nested dictionary)
     let mut hints = HashMap::new();
 
@@ -920,7 +922,8 @@ fn add_connection_hints(bolt_version: BoltVersion, metadata: &mut HashMap<String
 /// Prefers the highest supported version.
 ///
 /// Supports Bolt 4.4 and Bolt 5.0-5.7.
-fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
+#[cfg_attr(test, allow(dead_code))]
+pub fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
     const MAX_BOLT_5_MINOR: u8 = 7;
 
     // Try to negotiate highest version first (5.7 > ... > 5.0 > 4.4)
