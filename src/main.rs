@@ -15,6 +15,7 @@ mod engine_manager;
 mod graphj;
 mod journal;
 mod journal_s3;
+mod metrics;
 mod replica;
 mod neo4j_http;
 mod query;
@@ -238,6 +239,9 @@ async fn main() {
         info!("Replica poller started");
     }
 
+    // ── Metrics ──
+    let metrics = Arc::new(metrics::Metrics::new());
+
     // ── Bolt listener ──
     let bolt_state = bolt::BoltState {
         engine: engine.clone(),
@@ -246,6 +250,7 @@ async fn main() {
             config.bolt_max_connections as usize,
         )),
         replica: config.replica,
+        metrics: metrics.clone(),
     };
 
     // ── Shutdown signal ──
@@ -292,6 +297,7 @@ async fn main() {
         s3_bucket: config.s3_bucket.clone(),
         s3_prefix: config.s3_prefix.clone(),
         transactions: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        metrics: metrics.clone(),
     };
 
     // ── Transaction reaper ──
@@ -326,6 +332,7 @@ async fn main() {
         // Management
         .route("/v1/snapshot", post(neo4j_http::snapshot_handler))
         .route("/health", get(|| async { "ok" }))
+        .route("/metrics", get(neo4j_http::metrics_handler))
         .with_state(http_state);
 
     let http_addr = format!("{}:{}", config.http_host, config.http_port);

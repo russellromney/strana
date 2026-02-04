@@ -2,7 +2,7 @@
 
 Neo4j-compatible graph database server powered by embedded LadybugDB (formerly Kuzu).
 
-Exposes LadybugDB over Bolt 4.4–5.7 and Neo4j HTTP API. Adds journaling, point-in-time recovery, S3 backups, and read replicas via the `.graphj` format. Think [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) for graph databases.
+Exposes LadybugDB over Bolt 4.4–5.7 and Neo4j HTTP API. Adds journaling, point-in-time recovery, S3 backups, and read replicas via the new `.graphj` format. Think [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) for graph databases.
 
 ## Features
 

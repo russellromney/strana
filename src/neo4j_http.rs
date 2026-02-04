@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::auth::TokenStore;
 use crate::engine::Engine;
 use crate::journal::{self, JournalCommand, PendingEntry};
+use crate::metrics::Metrics;
 use crate::query::{self, ExecutedQuery};
 use crate::snapshot::RetentionConfig;
 use crate::values::{json_to_param_values, GraphValue};
@@ -27,6 +28,7 @@ pub struct AppState {
     pub s3_prefix: String,
     /// HTTP transaction store: tx_id → TransactionState.
     pub transactions: Arc<RwLock<HashMap<String, Arc<TransactionState>>>>,
+    pub metrics: Arc<Metrics>,
 }
 
 /// An open HTTP transaction.
@@ -178,19 +180,33 @@ pub async fn query_handler(
         return e;
     }
 
-    match state.engine.execute(req.statement, req.parameters).await {
-        Ok(eq) => (
-            StatusCode::ACCEPTED,
-            Json(QueryResponse {
-                data: QueryData {
-                    fields: eq.columns,
-                    values: rows_to_json(&eq.rows),
-                },
-                bookmarks: vec![],
-            }),
-        )
-            .into_response(),
-        Err(e) => db_error_response(&e),
+    let query_type = if journal::is_mutation(&req.statement) { "write" } else { "read" };
+    let timer = state.metrics.query_duration_seconds
+        .with_label_values(&[query_type])
+        .start_timer();
+
+    let result = state.engine.execute(req.statement, req.parameters).await;
+    timer.observe_duration();
+
+    match result {
+        Ok(eq) => {
+            state.metrics.queries_total.with_label_values(&[query_type, "success"]).inc();
+            (
+                StatusCode::ACCEPTED,
+                Json(QueryResponse {
+                    data: QueryData {
+                        fields: eq.columns,
+                        values: rows_to_json(&eq.rows),
+                    },
+                    bookmarks: vec![],
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            state.metrics.queries_total.with_label_values(&[query_type, "error"]).inc();
+            db_error_response(&e)
+        }
     }
 }
 
@@ -422,6 +438,19 @@ pub async fn snapshot_handler(
         }
         Err(e) => db_error_response(&e),
     }
+}
+
+/// GET /metrics — Prometheus metrics endpoint.
+pub async fn metrics_handler(State(state): State<AppState>) -> Response {
+    // Update gauge from transaction map size.
+    let tx_count = state.transactions.read().unwrap_or_else(|e| e.into_inner()).len();
+    state.metrics.http_transactions_active.set(tx_count as i64);
+
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.metrics.encode(),
+    )
+        .into_response()
 }
 
 // ─── Transaction worker ───
@@ -676,6 +705,56 @@ mod tests {
         let req: QueryRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.statement, "RETURN 1");
         assert!(req.parameters.is_none());
+    }
+
+    // ─── Transaction reaper ───
+
+    #[tokio::test]
+    async fn reaper_removes_stale_transactions() {
+        let txs: Arc<RwLock<HashMap<String, Arc<TransactionState>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Insert a "stale" transaction with last_accessed far in the past.
+        let (req_tx, _req_rx) = std::sync::mpsc::channel::<TxOp>();
+        let (_resp_tx, resp_rx) = std::sync::mpsc::channel::<TxResult>();
+        let state = Arc::new(TransactionState {
+            req_tx,
+            resp_rx: std::sync::Mutex::new(resp_rx),
+            last_accessed: std::sync::Mutex::new(Instant::now() - std::time::Duration::from_secs(120)),
+        });
+        txs.write().unwrap().insert("stale-tx".into(), state);
+
+        // Insert a "fresh" transaction.
+        let (req_tx2, _req_rx2) = std::sync::mpsc::channel::<TxOp>();
+        let (_resp_tx2, resp_rx2) = std::sync::mpsc::channel::<TxResult>();
+        let fresh = Arc::new(TransactionState {
+            req_tx: req_tx2,
+            resp_rx: std::sync::Mutex::new(resp_rx2),
+            last_accessed: std::sync::Mutex::new(Instant::now()),
+        });
+        txs.write().unwrap().insert("fresh-tx".into(), fresh);
+
+        // Run one reaper cycle inline (simulates what spawn_tx_reaper does).
+        let timeout = std::time::Duration::from_secs(30);
+        let stale: Vec<String> = {
+            let map = txs.read().unwrap();
+            map.iter()
+                .filter_map(|(id, s)| {
+                    let last = *s.last_accessed.lock().unwrap();
+                    if last.elapsed() > timeout { Some(id.clone()) } else { None }
+                })
+                .collect()
+        };
+        {
+            let mut map = txs.write().unwrap();
+            for id in &stale {
+                map.remove(id);
+            }
+        }
+
+        let map = txs.read().unwrap();
+        assert!(!map.contains_key("stale-tx"), "Stale tx should be reaped");
+        assert!(map.contains_key("fresh-tx"), "Fresh tx should remain");
     }
 
     // ─── Response serialization ───

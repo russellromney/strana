@@ -2,6 +2,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::error::GraphdError;
+
 /// Internal ID for nodes and relationships in the graph database.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InternalId {
@@ -169,7 +171,7 @@ fn lbug_value_logical_type(v: &lbug::Value) -> lbug::LogicalType {
 }
 
 /// Convert a JSON value to a LadybugDB value for parameter binding.
-pub fn to_lbug_value(json: &serde_json::Value) -> Result<lbug::Value, String> {
+pub fn to_lbug_value(json: &serde_json::Value) -> Result<lbug::Value, GraphdError> {
     match json {
         serde_json::Value::Null => Ok(lbug::Value::Null(lbug::LogicalType::Any)),
         serde_json::Value::Bool(b) => Ok(lbug::Value::Bool(*b)),
@@ -181,15 +183,14 @@ pub fn to_lbug_value(json: &serde_json::Value) -> Result<lbug::Value, String> {
             } else if let Some(f) = n.as_f64() {
                 Ok(lbug::Value::Double(f))
             } else {
-                Err("Unsupported number type".into())
+                Err(GraphdError::TypeError("Unsupported number type".into()))
             }
         }
         serde_json::Value::String(s) => Ok(lbug::Value::String(s.clone())),
         serde_json::Value::Array(arr) => {
-            let items: Result<Vec<lbug::Value>, String> =
+            let items: Result<Vec<lbug::Value>, GraphdError> =
                 arr.iter().map(to_lbug_value).collect();
             let items = items?;
-            // Infer element type from first item, default to Any for empty lists.
             let elem_type = items
                 .first()
                 .map(lbug_value_logical_type)
@@ -197,7 +198,7 @@ pub fn to_lbug_value(json: &serde_json::Value) -> Result<lbug::Value, String> {
             Ok(lbug::Value::List(elem_type, items))
         }
         serde_json::Value::Object(_) => {
-            Err("Objects not supported as query parameters".into())
+            Err(GraphdError::TypeError("Objects not supported as query parameters".into()))
         }
     }
 }
@@ -205,10 +206,10 @@ pub fn to_lbug_value(json: &serde_json::Value) -> Result<lbug::Value, String> {
 /// Convert a JSON params object to a Vec of (name, lbug::Value) pairs.
 pub fn json_params_to_lbug(
     params: &serde_json::Value,
-) -> Result<Vec<(String, lbug::Value)>, String> {
+) -> Result<Vec<(String, lbug::Value)>, GraphdError> {
     let obj = params
         .as_object()
-        .ok_or_else(|| "params must be a JSON object".to_string())?;
+        .ok_or_else(|| GraphdError::TypeError("params must be a JSON object".into()))?;
     obj.iter()
         .map(|(k, v)| Ok((k.clone(), to_lbug_value(v)?)))
         .collect()

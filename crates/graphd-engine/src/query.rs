@@ -1,5 +1,6 @@
 use tracing::warn;
 
+use crate::error::GraphdError;
 use crate::journal_types::{self, JournalCommand, JournalSender, PendingEntry};
 use crate::values::{self, json_params_to_lbug, GraphValue};
 
@@ -30,7 +31,7 @@ pub fn run_query_raw<'db>(
     conn: &lbug::Connection<'db>,
     query: &str,
     params: Option<&serde_json::Value>,
-) -> Result<RawExecution<'db>, String> {
+) -> Result<RawExecution<'db>, GraphdError> {
     // Rewrite non-deterministic functions (gen_random_uuid, current_timestamp, current_date)
     // to parameter references with concrete generated values.
     let rewrite = crate::rewriter::rewrite_query(query);
@@ -49,16 +50,17 @@ pub fn run_query_raw<'db>(
                 let refs: Vec<(&str, lbug::Value)> =
                     owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                 match conn.prepare(query) {
-                    Ok(mut prepared) => {
-                        conn.execute(&mut prepared, refs).map_err(|e| format!("{e}"))
-                    }
-                    Err(e) => Err(format!("{e}")),
+                    Ok(mut prepared) => conn
+                        .execute(&mut prepared, refs)
+                        .map_err(|e| GraphdError::SyntaxError(format!("{e}"))),
+                    Err(e) => Err(GraphdError::SyntaxError(format!("{e}"))),
                 }
             }
             Err(e) => Err(e),
         }
     } else {
-        conn.query(query).map_err(|e| format!("{e}"))
+        conn.query(query)
+            .map_err(|e| GraphdError::SyntaxError(format!("{e}")))
     };
 
     let merged_params = merged.clone();
@@ -109,7 +111,7 @@ pub fn run_query(
     conn: &lbug::Connection<'_>,
     query: &str,
     params: Option<&serde_json::Value>,
-) -> Result<ExecutedQuery, String> {
+) -> Result<ExecutedQuery, GraphdError> {
     let mut raw = run_query_raw(conn, query, params)?;
     let (rows, _) = take_rows(&mut raw.query_result, usize::MAX, &mut None);
     Ok(ExecutedQuery {

@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 use crate::auth::TokenStore;
 use crate::engine::Engine;
 use crate::journal::{self, JournalCommand, JournalSender, PendingEntry};
+use crate::metrics::Metrics;
 use crate::query;
 use crate::values::{self, json_to_param_values, GraphValue};
 
@@ -32,6 +33,7 @@ pub struct BoltState {
     pub tokens: Arc<TokenStore>,
     pub conn_semaphore: Arc<tokio::sync::Semaphore>,
     pub replica: bool,
+    pub metrics: Arc<Metrics>,
 }
 
 /// Start the Bolt TCP listener.
@@ -64,7 +66,10 @@ pub async fn listen(addr: String, state: BoltState, mut shutdown: tokio::sync::w
                         let state = state.clone();
                         tokio::spawn(async move {
                             let _permit = permit; // held until handler completes
-                            if let Err(e) = handle_connection(socket, state).await {
+                            state.metrics.bolt_connections_active.inc();
+                            let result = handle_connection(socket, state.clone()).await;
+                            state.metrics.bolt_connections_active.dec();
+                            if let Err(e) = result {
                                 debug!("Bolt connection error: {e}");
                             }
                         });

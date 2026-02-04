@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+use crate::error::GraphdError;
+
 /// Configuration for statement-level sandboxing.
 pub struct SandboxConfig {
     allowed_call_options: HashSet<String>,
@@ -39,12 +41,12 @@ impl SandboxConfig {
     ///
     /// Analyzes query keywords to block dangerous operations.
     /// Returns `Ok(())` if allowed, `Err(message)` if blocked.
-    pub fn check_query(&self, _conn: &lbug::Connection<'_>, query: &str) -> Result<(), String> {
+    pub fn check_query(&self, _conn: &lbug::Connection<'_>, query: &str) -> Result<(), GraphdError> {
         self.check_query_text(query)
     }
 
     /// Check query text without needing a connection (for testing).
-    pub fn check_query_text(&self, query: &str) -> Result<(), String> {
+    pub fn check_query_text(&self, query: &str) -> Result<(), GraphdError> {
         let normalized = query.trim();
         if normalized.is_empty() {
             return Ok(());
@@ -55,38 +57,38 @@ impl SandboxConfig {
 
         // Block all COPY statements (COPY FROM / COPY TO)
         if tokens.first().map_or(false, |t| t == "COPY") {
-            return Err("COPY is blocked in multi-tenant mode".to_string());
+            return Err(GraphdError::Forbidden("COPY is blocked in multi-tenant mode".into()));
         }
 
         // Block EXPORT DATABASE / IMPORT DATABASE
         if tokens.first().map_or(false, |t| t == "EXPORT" || t == "IMPORT") {
-            return Err(format!(
+            return Err(GraphdError::Forbidden(format!(
                 "{} is blocked in multi-tenant mode",
                 tokens[0]
-            ));
+            )));
         }
 
         // Block ATTACH / DETACH
         if tokens.first().map_or(false, |t| t == "ATTACH" || t == "DETACH") {
-            return Err(format!(
+            return Err(GraphdError::Forbidden(format!(
                 "{} is blocked in multi-tenant mode",
                 tokens[0]
-            ));
+            )));
         }
 
         // Block USE DATABASE (but allow USE GRAPH)
         if tokens.first().map_or(false, |t| t == "USE") {
             if tokens.get(1).map_or(false, |t| t != "GRAPH") {
-                return Err("USE DATABASE is blocked in multi-tenant mode".to_string());
+                return Err(GraphdError::Forbidden("USE DATABASE is blocked in multi-tenant mode".into()));
             }
         }
 
         // Block LOAD EXTENSION / INSTALL
         if tokens.first().map_or(false, |t| t == "LOAD" || t == "INSTALL") {
-            return Err(format!(
+            return Err(GraphdError::Forbidden(format!(
                 "{} is blocked in multi-tenant mode",
                 tokens[0]
-            ));
+            )));
         }
 
         // Filter CALL statements by option name
@@ -98,12 +100,12 @@ impl SandboxConfig {
     }
 
     /// Check a CALL statement by parsing the option name from the query.
-    fn check_call_statement(&self, query: &str) -> Result<(), String> {
+    fn check_call_statement(&self, query: &str) -> Result<(), GraphdError> {
         let trimmed = query.trim();
         let after_call = if let Some(rest) = strip_prefix_ci(trimmed, "CALL") {
             rest.trim_start()
         } else {
-            return Err("Expected CALL statement".to_string());
+            return Err(GraphdError::Forbidden("Expected CALL statement".into()));
         };
 
         let option_name: String = after_call
@@ -112,17 +114,19 @@ impl SandboxConfig {
             .collect();
 
         if option_name.is_empty() {
-            return Err("Could not parse option name from CALL statement".to_string());
+            return Err(GraphdError::Forbidden(
+                "Could not parse option name from CALL statement".into(),
+            ));
         }
 
         let option_lower = option_name.to_lowercase();
         if self.allowed_call_options.contains(&option_lower) {
             Ok(())
         } else {
-            Err(format!(
+            Err(GraphdError::Forbidden(format!(
                 "CALL option '{}' is not allowed in multi-tenant mode",
                 option_name
-            ))
+            )))
         }
     }
 }

@@ -3,6 +3,7 @@
 /kuzu-lib
 /kuzu-patched
 .env*
+uv.lock
 
 # Pre-built test fixtures (large DBs cached across runs)
 .test-fixtures/

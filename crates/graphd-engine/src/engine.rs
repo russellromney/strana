@@ -12,6 +12,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::backend::Backend;
+use crate::error::GraphdError;
 use crate::journal_types::{self as journal, JournalSender};
 use crate::query::{self, ExecutedQuery};
 
@@ -59,7 +60,7 @@ impl Engine {
         &self,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<ExecutedQuery, String> {
+    ) -> Result<ExecutedQuery, GraphdError> {
         // Sandbox check: prepare the query and verify the statement type is allowed.
         if let Some(ref sandbox) = self.sandbox {
             let backend = self.backend.clone();
@@ -70,7 +71,8 @@ impl Engine {
                 sandbox.check_query(&conn, &q)
             })
             .await
-            .map_err(|e| format!("Task panicked: {e}"))??;
+            .map_err(|e| GraphdError::DatabaseError(format!("Task panicked: {e}")))?
+            ?;
         }
 
         if journal::is_mutation(&query) {
@@ -84,12 +86,12 @@ impl Engine {
         &self,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<ExecutedQuery, String> {
+    ) -> Result<ExecutedQuery, GraphdError> {
         let _permit = self
             .read_semaphore
             .acquire()
             .await
-            .map_err(|_| "Engine closed".to_string())?;
+            .map_err(|_| GraphdError::DatabaseUnavailable("Engine closed".into()))?;
         let backend = self.backend.clone();
         let lock = self.snapshot_lock.clone();
         tokio::task::spawn_blocking(move || {
@@ -98,14 +100,14 @@ impl Engine {
             query::run_query(&conn, &query, params.as_ref())
         })
         .await
-        .map_err(|e| format!("Task panicked: {e}"))?
+        .map_err(|e| GraphdError::DatabaseError(format!("Task panicked: {e}")))?
     }
 
     async fn execute_write(
         &self,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<ExecutedQuery, String> {
+    ) -> Result<ExecutedQuery, GraphdError> {
         let _guard = self.write_mutex.lock().await;
         let backend = self.backend.clone();
         let lock = self.snapshot_lock.clone();
@@ -120,12 +122,12 @@ impl Engine {
             result
         })
         .await
-        .map_err(|e| format!("Task panicked: {e}"))?
+        .map_err(|e| GraphdError::DatabaseError(format!("Task panicked: {e}")))?
     }
 
     /// Create a dedicated connection for Bolt sessions and HTTP transactions.
     /// The caller owns the connection for its lifetime.
-    pub fn connection(&self) -> Result<lbug::Connection<'_>, String> {
+    pub fn connection(&self) -> Result<lbug::Connection<'_>, GraphdError> {
         self.backend.connection()
     }
 

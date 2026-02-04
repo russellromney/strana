@@ -7,6 +7,7 @@ pub mod engine_manager;
 pub mod graphj;
 pub mod journal;
 pub mod journal_s3;
+pub mod metrics;
 pub mod neo4j_http;
 pub mod query;
 pub mod replica;
