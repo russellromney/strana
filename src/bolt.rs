@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::TokenStore;
+use crate::auth::{RateLimiter, TokenStore};
 use crate::engine::Engine;
 use crate::journal::{self, JournalCommand, JournalSender, PendingEntry};
 use crate::metrics::Metrics;
@@ -34,6 +34,7 @@ pub struct BoltState {
     pub conn_semaphore: Arc<tokio::sync::Semaphore>,
     pub replica: bool,
     pub metrics: Arc<Metrics>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 /// Start the Bolt TCP listener.
@@ -67,7 +68,7 @@ pub async fn listen(addr: String, state: BoltState, mut shutdown: tokio::sync::w
                         tokio::spawn(async move {
                             let _permit = permit; // held until handler completes
                             state.metrics.bolt_connections_active.inc();
-                            let result = handle_connection(socket, state.clone()).await;
+                            let result = handle_connection(socket, state.clone(), peer.ip()).await;
                             state.metrics.bolt_connections_active.dec();
                             if let Err(e) = result {
                                 debug!("Bolt connection error: {e}");
@@ -88,7 +89,7 @@ pub async fn listen(addr: String, state: BoltState, mut shutdown: tokio::sync::w
 }
 
 /// Handle the full lifecycle of one Bolt TCP connection.
-async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), String> {
+async fn handle_connection(socket: TcpStream, state: BoltState, peer_ip: std::net::IpAddr) -> Result<(), String> {
     let mut stream = BufStream::new(socket);
 
     // ── Bolt handshake ──
@@ -143,9 +144,12 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
     let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<BoltOp>();
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Bytes>>();
 
+    let metrics = state.metrics.clone();
+    let rate_limiter = state.rate_limiter.clone();
+
     // Blocking session worker.
     let worker_handle = tokio::task::spawn_blocking(move || {
-        bolt_session_worker(bolt_version, engine, tokens, replica, req_rx, resp_tx);
+        bolt_session_worker(bolt_version, engine, tokens, replica, metrics, rate_limiter, peer_ip, req_rx, resp_tx);
     });
 
     // ── Message loop ──
@@ -209,6 +213,9 @@ fn bolt_session_worker(
     engine: Arc<Engine>,
     tokens: Arc<TokenStore>,
     replica: bool,
+    metrics: Arc<Metrics>,
+    rate_limiter: Arc<RateLimiter>,
+    peer_ip: std::net::IpAddr,
     rx: tokio::sync::mpsc::UnboundedReceiver<BoltOp>,
     tx: tokio::sync::mpsc::UnboundedSender<Vec<Bytes>>,
 ) {
@@ -263,6 +270,9 @@ fn bolt_session_worker(
             &journal,
             &snapshot_lock,
             replica,
+            &metrics,
+            &rate_limiter,
+            peer_ip,
             &mut authenticated,
             &mut in_transaction,
             &mut tx_journal_buf,
@@ -326,6 +336,9 @@ fn handle_bolt_message<'db>(
     journal: &Option<JournalSender>,
     snapshot_lock: &Arc<RwLock<()>>,
     replica: bool,
+    metrics: &Arc<Metrics>,
+    rate_limiter: &Arc<RateLimiter>,
+    peer_ip: std::net::IpAddr,
     authenticated: &mut bool,
     in_transaction: &mut bool,
     tx_journal_buf: &mut Vec<PendingEntry>,
@@ -336,6 +349,18 @@ fn handle_bolt_message<'db>(
     match req {
         // ── HELLO ──
         Message::Hello(hello) => {
+            // Check rate limit before auth.
+            let delay = rate_limiter.check_delay(peer_ip);
+            if delay >= std::time::Duration::from_secs(10) {
+                return failure_message_versioned(
+                    bolt_version,
+                    "Neo.ClientError.Security.AuthenticationRateLimit",
+                    "Too many failed authentication attempts",
+                );
+            } else if delay > std::time::Duration::ZERO {
+                std::thread::sleep(delay);
+            }
+
             if tokens.is_empty() {
                 // Open access — no tokens configured.
                 *authenticated = true;
@@ -347,9 +372,11 @@ fn handle_bolt_message<'db>(
                     Some(token) => match tokens.validate(token) {
                         Ok(label) => {
                             *authenticated = true;
+                            rate_limiter.record_success(peer_ip);
                             info!("Bolt: authenticated (label={label})");
                         }
                         Err(_) => {
+                            rate_limiter.record_failure(peer_ip);
                             return failure_message_versioned(
                                 bolt_version,
                                 "Neo.ClientError.Security.Unauthorized",
@@ -358,6 +385,7 @@ fn handle_bolt_message<'db>(
                         }
                     },
                     None => {
+                        rate_limiter.record_failure(peer_ip);
                         return failure_message_versioned(
                             bolt_version,
                             "Neo.ClientError.Security.Unauthorized",
@@ -394,9 +422,10 @@ fn handle_bolt_message<'db>(
             }
 
             let query_str = run.query();
+            let query_type = if journal::is_mutation(query_str) { "write" } else { "read" };
 
             // Reject mutations in replica mode.
-            if replica && journal::is_mutation(query_str) {
+            if replica && query_type == "write" {
                 return failure_message_versioned(
                     bolt_version,
                     "Neo.ClientError.Database.ReadOnlyMode",
@@ -414,8 +443,15 @@ fn handle_bolt_message<'db>(
                 None
             };
 
+            let timer = metrics.query_duration_seconds
+                .with_label_values(&[query_type])
+                .start_timer();
+
             match query::run_query_raw(conn, query_str, json_params.as_ref()) {
                 Ok(raw) => {
+                    timer.observe_duration();
+                    metrics.queries_total.with_label_values(&[query_type, "success"]).inc();
+
                     // Journal the mutation.
                     if *in_transaction {
                         if journal::is_mutation(&raw.rewritten_query) {
@@ -438,6 +474,8 @@ fn handle_bolt_message<'db>(
                     success_message(metadata)
                 }
                 Err(e) => {
+                    timer.observe_duration();
+                    metrics.queries_total.with_label_values(&[query_type, "error"]).inc();
                     failure_message_versioned(bolt_version,
                         "Neo.DatabaseError.General.UnknownError",
                         &format!("Query error: {e}"),
@@ -456,9 +494,10 @@ fn handle_bolt_message<'db>(
             }
 
             let query_str = run.statement();
+            let query_type = if journal::is_mutation(query_str) { "write" } else { "read" };
 
             // Reject mutations in replica mode.
-            if replica && journal::is_mutation(query_str) {
+            if replica && query_type == "write" {
                 return failure_message_versioned(bolt_version,
                     "Neo.ClientError.Database.ReadOnlyMode",
                     "Cannot execute write operations on a read-only replica",
@@ -475,8 +514,15 @@ fn handle_bolt_message<'db>(
                 None
             };
 
+            let timer = metrics.query_duration_seconds
+                .with_label_values(&[query_type])
+                .start_timer();
+
             match query::run_query_raw(conn, query_str, json_params.as_ref()) {
                 Ok(raw) => {
+                    timer.observe_duration();
+                    metrics.queries_total.with_label_values(&[query_type, "success"]).inc();
+
                     // Journal the mutation.
                     if *in_transaction {
                         if journal::is_mutation(&raw.rewritten_query) {
@@ -499,6 +545,8 @@ fn handle_bolt_message<'db>(
                     success_message(metadata)
                 }
                 Err(e) => {
+                    timer.observe_duration();
+                    metrics.queries_total.with_label_values(&[query_type, "error"]).inc();
                     failure_message_versioned(bolt_version,
                         "Neo.DatabaseError.General.UnknownError",
                         &format!("Query error: {e}"),
@@ -671,6 +719,18 @@ fn handle_bolt_message<'db>(
 
         // ── LOGON (Bolt 5.x) ──
         Message::Logon(logon) => {
+            // Check rate limit before auth.
+            let delay = rate_limiter.check_delay(peer_ip);
+            if delay >= std::time::Duration::from_secs(10) {
+                return failure_message_versioned(
+                    bolt_version,
+                    "Neo.ClientError.Security.AuthenticationRateLimit",
+                    "Too many failed authentication attempts",
+                );
+            } else if delay > std::time::Duration::ZERO {
+                std::thread::sleep(delay);
+            }
+
             // LOGON replaces HELLO in Bolt 5.0+
             // Handle authentication the same way as HELLO
             if tokens.is_empty() {
@@ -683,9 +743,11 @@ fn handle_bolt_message<'db>(
                     Some(token) => match tokens.validate(token) {
                         Ok(label) => {
                             *authenticated = true;
+                            rate_limiter.record_success(peer_ip);
                             info!("Bolt 5.x: authenticated (label={label})");
                         }
                         Err(_) => {
+                            rate_limiter.record_failure(peer_ip);
                             return failure_message_versioned(
                                 bolt_version,
                                 "Neo.ClientError.Security.Unauthorized",
@@ -694,6 +756,7 @@ fn handle_bolt_message<'db>(
                         }
                     },
                     None => {
+                        rate_limiter.record_failure(peer_ip);
                         return failure_message_versioned(
                             bolt_version,
                             "Neo.ClientError.Security.Unauthorized",

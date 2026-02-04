@@ -13,10 +13,12 @@ pub(crate) struct RawExecution<'db> {
     pub merged_params: Option<serde_json::Value>,
 }
 
-/// Result of executing a query via `run_query`, with all rows materialized.
+/// Result of executing a query via `run_query`, with rows materialized.
 pub struct ExecutedQuery {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<GraphValue>>,
+    /// True if more rows exist beyond the returned limit.
+    pub has_more: bool,
     /// The rewritten query (with non-deterministic functions replaced).
     pub rewritten_query: String,
     /// Merged params (user + generated). None if no params.
@@ -109,11 +111,23 @@ pub(crate) fn run_query(
     query: &str,
     params: Option<&serde_json::Value>,
 ) -> Result<ExecutedQuery, String> {
+    run_query_limited(conn, query, params, usize::MAX)
+}
+
+/// Execute a single query, collecting up to `limit` rows.
+/// Returns `has_more = true` if the result set exceeds the limit.
+pub(crate) fn run_query_limited(
+    conn: &lbug::Connection<'_>,
+    query: &str,
+    params: Option<&serde_json::Value>,
+    limit: usize,
+) -> Result<ExecutedQuery, String> {
     let mut raw = run_query_raw(conn, query, params)?;
-    let (rows, _) = take_rows(&mut raw.query_result, usize::MAX, &mut None);
+    let (rows, has_more) = take_rows(&mut raw.query_result, limit, &mut None);
     Ok(ExecutedQuery {
         columns: raw.columns,
         rows,
+        has_more,
         rewritten_query: raw.rewritten_query,
         merged_params: raw.merged_params,
     })

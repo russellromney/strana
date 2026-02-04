@@ -336,6 +336,18 @@ fn test_tx_timeout_custom() {
 }
 
 #[test]
+fn test_query_timeout_ms_default() {
+    let config = graphd::config::Config::parse_from(vec!["graphd"]);
+    assert_eq!(config.query_timeout_ms, 0);
+}
+
+#[test]
+fn test_query_timeout_ms_custom() {
+    let config = graphd::config::Config::parse_from(vec!["graphd", "--query-timeout-ms", "5000"]);
+    assert_eq!(config.query_timeout_ms, 5000);
+}
+
+#[test]
 fn test_bolt_max_connections_default() {
     let config = graphd::config::Config::parse_from(vec!["graphd"]);
     assert_eq!(config.bolt_max_connections, 256);

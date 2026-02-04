@@ -85,10 +85,11 @@ pub fn rewrite_query(query: &str) -> RewriteResult {
         }
     }
 
+    let query_str = unsafe { String::from_utf8_unchecked(output) };
+    let query_str = rewrite_remove(&query_str);
+
     RewriteResult {
-        // Input was valid UTF-8, and we only insert ASCII replacements,
-        // so the output is always valid UTF-8.
-        query: unsafe { String::from_utf8_unchecked(output) },
+        query: query_str,
         generated_params,
     }
 }
@@ -110,6 +111,160 @@ pub fn merge_params(
         obj.insert(key.clone(), val.clone());
     }
     Some(serde_json::Value::Object(obj))
+}
+
+// ─── REMOVE rewrite ───
+
+const REMOVE_KW: &[u8] = b"REMOVE";
+
+/// Rewrite `REMOVE <expr>.<prop>` to `SET <expr>.<prop> = NULL`.
+///
+/// Handles single property removal only (not label removal or multi-item).
+/// Respects string literals — does not rewrite inside '...' or "...".
+/// Case-insensitive keyword matching with word boundary checks.
+fn rewrite_remove(query: &str) -> String {
+    let bytes = query.as_bytes();
+    let len = bytes.len();
+    let mut output = Vec::with_capacity(len);
+    let mut i = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut changed = false;
+
+    while i < len {
+        // String literal tracking (same logic as rewrite_query)
+        if in_single_quote {
+            output.push(bytes[i]);
+            if bytes[i] == b'\'' {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    output.push(bytes[i + 1]);
+                    i += 2;
+                } else {
+                    in_single_quote = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_double_quote {
+            output.push(bytes[i]);
+            if bytes[i] == b'"' {
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            in_single_quote = true;
+            output.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            in_double_quote = true;
+            output.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        // Try to match REMOVE keyword
+        if i + REMOVE_KW.len() <= len
+            && bytes[i..i + REMOVE_KW.len()].eq_ignore_ascii_case(REMOVE_KW)
+        {
+            // Word boundary: not preceded by alphanumeric
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            // Word boundary: not followed by alphanumeric (after keyword)
+            let after_pos = i + REMOVE_KW.len();
+            let after_ok =
+                after_pos >= len || !bytes[after_pos].is_ascii_alphanumeric();
+
+            if before_ok && after_ok {
+                // Scan ahead: skip whitespace, then look for <expr>.<prop> pattern.
+                // A property expression is: identifier chars, then '.', then identifier chars.
+                let mut j = after_pos;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+
+                if let Some((prop_end, has_dot)) = scan_property_expr(bytes, j) {
+                    if has_dot {
+                        // It's a property removal: REMOVE n.prop → SET n.prop = NULL
+                        output.extend_from_slice(b"SET ");
+                        // Copy the property expression preserving original case
+                        output.extend_from_slice(&bytes[j..prop_end]);
+                        output.extend_from_slice(b" = NULL");
+                        i = prop_end;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        output.push(bytes[i]);
+        i += 1;
+    }
+
+    if changed {
+        unsafe { String::from_utf8_unchecked(output) }
+    } else {
+        query.to_string()
+    }
+}
+
+/// Scan a property expression starting at `pos`.
+/// Returns `(end_pos, has_dot)` where `has_dot` indicates it's a property access (n.prop)
+/// vs a label expression (n:Label) which we don't rewrite.
+///
+/// Accepts identifiers with backtick quoting: `weird name`.prop
+fn scan_property_expr(bytes: &[u8], pos: usize) -> Option<(usize, bool)> {
+    let len = bytes.len();
+    if pos >= len {
+        return None;
+    }
+
+    // Scan first identifier (variable name): alphanumeric, underscore, or backtick-quoted
+    let mut i = scan_identifier(bytes, pos)?;
+
+    // Check what follows: '.' means property access, ':' means label, anything else = not a match
+    if i >= len || bytes[i] != b'.' {
+        return Some((i, false));
+    }
+    i += 1; // skip '.'
+
+    // Scan property name
+    let end = scan_identifier(bytes, i)?;
+    Some((end, true))
+}
+
+/// Scan a single Cypher identifier at `pos`. Returns end position.
+/// Handles plain identifiers (alphanumeric + underscore) and backtick-quoted identifiers.
+fn scan_identifier(bytes: &[u8], pos: usize) -> Option<usize> {
+    let len = bytes.len();
+    if pos >= len {
+        return None;
+    }
+    if bytes[pos] == b'`' {
+        // Backtick-quoted identifier
+        let mut i = pos + 1;
+        while i < len && bytes[i] != b'`' {
+            i += 1;
+        }
+        if i >= len {
+            return None; // unclosed backtick
+        }
+        Some(i + 1) // past closing backtick
+    } else if bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'_' {
+        let mut i = pos + 1;
+        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        Some(i)
+    } else {
+        None
+    }
 }
 
 // ─── Internals ───
@@ -402,5 +557,90 @@ mod tests {
         let val = r.generated_params[0].1.as_str().unwrap();
         let parsed = uuid::Uuid::parse_str(val).unwrap();
         assert_eq!(parsed.get_version_num(), 4);
+    }
+
+    // ─── REMOVE rewrite tests ───
+
+    #[test]
+    fn test_remove_property() {
+        let r = rewrite_query("MATCH (n:Person) REMOVE n.age");
+        assert_eq!(r.query, "MATCH (n:Person) SET n.age = NULL");
+    }
+
+    #[test]
+    fn test_remove_property_case_insensitive() {
+        let r = rewrite_query("MATCH (n) remove n.prop");
+        assert_eq!(r.query, "MATCH (n) SET n.prop = NULL");
+
+        let r2 = rewrite_query("MATCH (n) Remove n.prop");
+        assert_eq!(r2.query, "MATCH (n) SET n.prop = NULL");
+    }
+
+    #[test]
+    fn test_remove_property_extra_whitespace() {
+        let r = rewrite_query("MATCH (n) REMOVE   n.prop");
+        assert_eq!(r.query, "MATCH (n) SET n.prop = NULL");
+    }
+
+    #[test]
+    fn test_remove_preserves_surrounding_query() {
+        let r = rewrite_query("MATCH (n:Person) REMOVE n.age RETURN n");
+        assert_eq!(r.query, "MATCH (n:Person) SET n.age = NULL RETURN n");
+    }
+
+    #[test]
+    fn test_remove_underscore_identifiers() {
+        let r = rewrite_query("MATCH (my_node) REMOVE my_node.some_prop");
+        assert_eq!(r.query, "MATCH (my_node) SET my_node.some_prop = NULL");
+    }
+
+    #[test]
+    fn test_remove_backtick_variable() {
+        let r = rewrite_query("MATCH (`my node`) REMOVE `my node`.prop");
+        assert_eq!(r.query, "MATCH (`my node`) SET `my node`.prop = NULL");
+    }
+
+    #[test]
+    fn test_remove_backtick_property() {
+        let r = rewrite_query("MATCH (n) REMOVE n.`weird prop`");
+        assert_eq!(r.query, "MATCH (n) SET n.`weird prop` = NULL");
+    }
+
+    #[test]
+    fn test_remove_not_in_string_literal() {
+        let r = rewrite_query("RETURN 'REMOVE n.prop' AS s");
+        assert_eq!(r.query, "RETURN 'REMOVE n.prop' AS s");
+    }
+
+    #[test]
+    fn test_remove_not_in_double_quote_string() {
+        let r = rewrite_query("RETURN \"REMOVE n.prop\" AS s");
+        assert_eq!(r.query, "RETURN \"REMOVE n.prop\" AS s");
+    }
+
+    #[test]
+    fn test_remove_label_not_rewritten() {
+        // REMOVE n:Label is label removal — not rewritable to SET
+        let r = rewrite_query("MATCH (n) REMOVE n:SomeLabel");
+        // Should pass through unchanged (no dot = not a property removal)
+        assert_eq!(r.query, "MATCH (n) REMOVE n:SomeLabel");
+    }
+
+    #[test]
+    fn test_remove_word_boundary() {
+        // "REMOVED" should not match (alphanumeric after keyword)
+        let r = rewrite_query("RETURN REMOVED AS alias");
+        assert_eq!(r.query, "RETURN REMOVED AS alias");
+    }
+
+    #[test]
+    fn test_remove_combined_with_function_rewrite() {
+        // Both rewrites should apply in the same query
+        let r = rewrite_query("MATCH (n) REMOVE n.ts SET n.id = gen_random_uuid()");
+        assert_eq!(
+            r.query,
+            "MATCH (n) SET n.ts = NULL SET n.id = $__graphd_uuid_0"
+        );
+        assert_eq!(r.generated_params.len(), 1);
     }
 }

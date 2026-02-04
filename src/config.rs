@@ -86,6 +86,23 @@ pub struct Config {
     #[arg(long, default_value = "30", env = "GRAPHD_TX_TIMEOUT")]
     pub tx_timeout_secs: u64,
 
+    /// Query execution timeout in milliseconds. 0 = disabled (no timeout).
+    /// Applies to all queries across HTTP and Bolt connections.
+    #[arg(long, default_value = "0", env = "GRAPHD_QUERY_TIMEOUT_MS")]
+    pub query_timeout_ms: u64,
+
+    /// Auth rate limit: failed attempts before exponential backoff starts.
+    #[arg(long, default_value = "5", env = "GRAPHD_AUTH_RATE_LIMIT_THRESHOLD")]
+    pub auth_rate_limit_threshold: u32,
+
+    /// Auth rate limit: initial backoff delay in milliseconds.
+    #[arg(long, default_value = "100", env = "GRAPHD_AUTH_RATE_LIMIT_BASE_MS")]
+    pub auth_rate_limit_base_ms: u64,
+
+    /// Auth rate limit: maximum backoff delay in milliseconds.
+    #[arg(long, default_value = "30000", env = "GRAPHD_AUTH_RATE_LIMIT_MAX_MS")]
+    pub auth_rate_limit_max_ms: u64,
+
     /// Maximum number of concurrent Bolt connections.
     #[arg(long, default_value = "256", env = "GRAPHD_BOLT_MAX_CONNECTIONS")]
     pub bolt_max_connections: u32,

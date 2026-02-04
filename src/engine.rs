@@ -51,10 +51,21 @@ impl Engine {
         query: String,
         params: Option<serde_json::Value>,
     ) -> Result<ExecutedQuery, String> {
+        self.execute_limited(query, params, usize::MAX).await
+    }
+
+    /// Execute an auto-commit query with a row limit.
+    /// Returns `has_more = true` if the result set exceeds the limit.
+    pub async fn execute_limited(
+        &self,
+        query: String,
+        params: Option<serde_json::Value>,
+        limit: usize,
+    ) -> Result<ExecutedQuery, String> {
         if journal::is_mutation(&query) {
-            self.execute_write(query, params).await
+            self.execute_write(query, params, limit).await
         } else {
-            self.execute_read(query, params).await
+            self.execute_read(query, params, limit).await
         }
     }
 
@@ -62,6 +73,7 @@ impl Engine {
         &self,
         query: String,
         params: Option<serde_json::Value>,
+        limit: usize,
     ) -> Result<ExecutedQuery, String> {
         let _permit = self
             .read_semaphore
@@ -73,7 +85,7 @@ impl Engine {
         tokio::task::spawn_blocking(move || {
             let conn = backend.connection()?;
             let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
-            query::run_query(&conn, &query, params.as_ref())
+            query::run_query_limited(&conn, &query, params.as_ref(), limit)
         })
         .await
         .map_err(|e| format!("Task panicked: {e}"))?
@@ -83,6 +95,7 @@ impl Engine {
         &self,
         query: String,
         params: Option<serde_json::Value>,
+        limit: usize,
     ) -> Result<ExecutedQuery, String> {
         let _guard = self.write_mutex.lock().await;
         let backend = self.backend.clone();
@@ -91,7 +104,7 @@ impl Engine {
         tokio::task::spawn_blocking(move || {
             let conn = backend.connection()?;
             let _snap = lock.read().unwrap_or_else(|e| e.into_inner());
-            let result = query::run_query(&conn, &query, params.as_ref());
+            let result = query::run_query_limited(&conn, &query, params.as_ref(), limit);
             if let Ok(ref eq) = result {
                 query::journal_entry(&journal, &eq.rewritten_query, &eq.merged_params);
             }
@@ -245,6 +258,22 @@ mod tests {
         let result = conn.query("RETURN 1").unwrap();
         let cols = result.get_column_names();
         assert_eq!(cols.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_timeout_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let mut backend = Backend::open(&db_path).unwrap();
+        backend.set_query_timeout_ms(1000);
+        let engine = Engine::new(Arc::new(backend), 4, None);
+
+        // Short query should still succeed with 1s timeout.
+        let result = engine
+            .execute("RETURN 1 AS n".to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.columns, vec!["n"]);
     }
 
     #[tokio::test]

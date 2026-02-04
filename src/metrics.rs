@@ -111,10 +111,11 @@ mod tests {
     }
 
     #[test]
-    fn encode_empty_metrics() {
+    fn encode_includes_gauges_at_zero() {
         let m = Metrics::new();
         let output = m.encode();
-        // Should contain metric descriptors even with no data
-        assert!(output.contains("graphd_queries_total"));
+        // Gauges are included even at default value (0).
+        assert!(output.contains("graphd_bolt_connections_active 0"));
+        assert!(output.contains("graphd_http_transactions_active 0"));
     }
 }

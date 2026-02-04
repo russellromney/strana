@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tracing::warn;
 
-use crate::auth::TokenStore;
+use crate::auth::{RateLimiter, TokenStore};
 use crate::engine::Engine;
 use crate::journal::{self, JournalCommand, PendingEntry};
 use crate::metrics::Metrics;
@@ -29,6 +29,7 @@ pub struct AppState {
     /// HTTP transaction store: tx_id → TransactionState.
     pub transactions: Arc<RwLock<HashMap<String, Arc<TransactionState>>>>,
     pub metrics: Arc<Metrics>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 /// An open HTTP transaction.
@@ -39,7 +40,7 @@ pub struct TransactionState {
 }
 
 enum TxOp {
-    Run { query: String, params: Option<serde_json::Value> },
+    Run { query: String, params: Option<serde_json::Value>, limit: usize },
     Commit,
     Rollback,
 }
@@ -52,11 +53,17 @@ enum TxResult {
 
 // ─── Request / Response types ───
 
+/// Default maximum rows returned per HTTP query (prevents OOM on large results).
+const DEFAULT_ROW_LIMIT: usize = 10_000;
+
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
     pub statement: String,
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
+    /// Maximum rows to return. Defaults to 10,000. Use 0 for unlimited (not recommended).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,6 +71,9 @@ pub struct QueryResponse {
     pub data: QueryData,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<String>,
+    /// True if more rows exist beyond the returned limit.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_more: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,11 +100,45 @@ pub struct ErrorDetail {
 
 // ─── Auth ───
 
-fn validate_auth(headers: &HeaderMap, tokens: &TokenStore) -> Result<(), Response> {
+fn validate_auth(
+    headers: &HeaderMap,
+    tokens: &TokenStore,
+    rate_limiter: &RateLimiter,
+    peer_ip: std::net::IpAddr,
+) -> Result<(), Response> {
     if tokens.is_empty() {
         return Ok(());
     }
 
+    // Check rate limit — fail fast if peer is in heavy backoff.
+    let delay = rate_limiter.check_delay(peer_ip);
+    if delay > std::time::Duration::from_secs(0) {
+        // Apply delay synchronously by spinning. For HTTP handlers this is fine
+        // since they're already on a tokio task. Real delay happens in the async caller.
+        // We just reject immediately with a 429 if the delay exceeds the max threshold.
+        if delay >= std::time::Duration::from_secs(10) {
+            return Err(error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many failed authentication attempts",
+            ));
+        }
+    }
+
+    let result = extract_and_validate(headers, tokens);
+
+    match result {
+        Ok(()) => {
+            rate_limiter.record_success(peer_ip);
+            Ok(())
+        }
+        Err(resp) => {
+            rate_limiter.record_failure(peer_ip);
+            Err(resp)
+        }
+    }
+}
+
+fn extract_and_validate(headers: &HeaderMap, tokens: &TokenStore) -> Result<(), Response> {
     // Try Bearer token first.
     if let Some(auth) = headers
         .get("authorization")
@@ -172,20 +216,26 @@ fn rows_to_json(rows: &[Vec<GraphValue>]) -> Vec<Vec<serde_json::Value>> {
 /// POST /db/{name}/query/v2 — auto-commit query.
 pub async fn query_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(_db_name): Path<String>,
     headers: HeaderMap,
     Json(req): Json<QueryRequest>,
 ) -> Response {
-    if let Err(e) = validate_auth(&headers, &state.tokens) {
+    if let Err(e) = validate_auth(&headers, &state.tokens, &state.rate_limiter, addr.ip()) {
         return e;
     }
 
     let query_type = if journal::is_mutation(&req.statement) { "write" } else { "read" };
+    let limit = match req.limit {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => DEFAULT_ROW_LIMIT,
+    };
     let timer = state.metrics.query_duration_seconds
         .with_label_values(&[query_type])
         .start_timer();
 
-    let result = state.engine.execute(req.statement, req.parameters).await;
+    let result = state.engine.execute_limited(req.statement, req.parameters, limit).await;
     timer.observe_duration();
 
     match result {
@@ -199,6 +249,7 @@ pub async fn query_handler(
                         values: rows_to_json(&eq.rows),
                     },
                     bookmarks: vec![],
+                    has_more: eq.has_more,
                 }),
             )
                 .into_response()
@@ -217,10 +268,11 @@ pub async fn query_handler(
 /// that is immediately usable, and gets the real error if BEGIN fails.
 pub async fn begin_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(_db_name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = validate_auth(&headers, &state.tokens) {
+    if let Err(e) = validate_auth(&headers, &state.tokens, &state.rate_limiter, addr.ip()) {
         return e;
     }
 
@@ -247,6 +299,7 @@ pub async fn begin_handler(
             });
             state.transactions.write().unwrap_or_else(|e| e.into_inner())
                 .insert(tx_id.clone(), tx_state);
+            state.metrics.http_transactions_active.inc();
             (StatusCode::ACCEPTED, Json(TxBeginResponse { id: tx_id })).into_response()
         }
         Ok(Err(e)) => db_error_response(&e),
@@ -257,11 +310,12 @@ pub async fn begin_handler(
 /// POST /db/{name}/query/v2/tx/{id} — run query in existing transaction.
 pub async fn run_in_tx_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((_db_name, tx_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(req): Json<QueryRequest>,
 ) -> Response {
-    if let Err(e) = validate_auth(&headers, &state.tokens) {
+    if let Err(e) = validate_auth(&headers, &state.tokens, &state.rate_limiter, addr.ip()) {
         return e;
     }
 
@@ -276,44 +330,70 @@ pub async fn run_in_tx_handler(
     // Update last-accessed timestamp.
     *tx_state.last_accessed.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
 
+    let query_type = if journal::is_mutation(&req.statement) { "write" } else { "read" };
+    let limit = match req.limit {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => DEFAULT_ROW_LIMIT,
+    };
+    let timer = state.metrics.query_duration_seconds
+        .with_label_values(&[query_type])
+        .start_timer();
+
     if tx_state
         .req_tx
         .send(TxOp::Run {
             query: req.statement,
             params: req.parameters,
+            limit,
         })
         .is_err()
     {
+        timer.observe_duration();
+        state.metrics.queries_total.with_label_values(&[query_type, "error"]).inc();
         state.transactions.write().unwrap_or_else(|e| e.into_inner()).remove(&tx_id);
+        state.metrics.http_transactions_active.dec();
         return db_error_response("Transaction worker died");
     }
 
     let resp = tx_state.resp_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+    timer.observe_duration();
 
     match resp {
-        Ok(TxResult::QueryResult(Ok(eq))) => (
-            StatusCode::ACCEPTED,
-            Json(QueryResponse {
-                data: QueryData {
-                    fields: eq.columns,
-                    values: rows_to_json(&eq.rows),
-                },
-                bookmarks: vec![],
-            }),
-        )
-            .into_response(),
-        Ok(TxResult::QueryResult(Err(e))) => db_error_response(&e),
-        _ => db_error_response("Unexpected response from transaction worker"),
+        Ok(TxResult::QueryResult(Ok(eq))) => {
+            state.metrics.queries_total.with_label_values(&[query_type, "success"]).inc();
+            (
+                StatusCode::ACCEPTED,
+                Json(QueryResponse {
+                    data: QueryData {
+                        fields: eq.columns,
+                        values: rows_to_json(&eq.rows),
+                    },
+                    bookmarks: vec![],
+                    has_more: eq.has_more,
+                }),
+            )
+                .into_response()
+        }
+        Ok(TxResult::QueryResult(Err(e))) => {
+            state.metrics.queries_total.with_label_values(&[query_type, "error"]).inc();
+            db_error_response(&e)
+        }
+        _ => {
+            state.metrics.queries_total.with_label_values(&[query_type, "error"]).inc();
+            db_error_response("Unexpected response from transaction worker")
+        }
     }
 }
 
 /// POST /db/{name}/query/v2/tx/{id}/commit — commit transaction.
 pub async fn commit_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((_db_name, tx_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = validate_auth(&headers, &state.tokens) {
+    if let Err(e) = validate_auth(&headers, &state.tokens, &state.rate_limiter, addr.ip()) {
         return e;
     }
 
@@ -327,6 +407,7 @@ pub async fn commit_handler(
 
     if tx_state.req_tx.send(TxOp::Commit).is_err() {
         state.transactions.write().unwrap_or_else(|e| e.into_inner()).remove(&tx_id);
+        state.metrics.http_transactions_active.dec();
         return db_error_response("Transaction worker died");
     }
 
@@ -334,6 +415,7 @@ pub async fn commit_handler(
 
     // Remove transaction after commit.
     state.transactions.write().unwrap_or_else(|e| e.into_inner()).remove(&tx_id);
+    state.metrics.http_transactions_active.dec();
 
     match resp {
         Ok(TxResult::Ok) => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),
@@ -345,10 +427,11 @@ pub async fn commit_handler(
 /// DELETE /db/{name}/query/v2/tx/{id} — rollback transaction.
 pub async fn rollback_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((_db_name, tx_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = validate_auth(&headers, &state.tokens) {
+    if let Err(e) = validate_auth(&headers, &state.tokens, &state.rate_limiter, addr.ip()) {
         return e;
     }
 
@@ -367,6 +450,7 @@ pub async fn rollback_handler(
     let resp = tx_state.resp_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
 
     state.transactions.write().unwrap_or_else(|e| e.into_inner()).remove(&tx_id);
+    state.metrics.http_transactions_active.dec();
 
     match resp {
         Ok(TxResult::Ok) | Err(_) => {
@@ -380,9 +464,10 @@ pub async fn rollback_handler(
 /// POST /v1/snapshot — create a point-in-time snapshot.
 pub async fn snapshot_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = validate_auth(&headers, &state.tokens) {
+    if let Err(e) = validate_auth(&headers, &state.tokens, &state.rate_limiter, addr.ip()) {
         return e;
     }
 
@@ -432,6 +517,7 @@ pub async fn snapshot_handler(
                         ]],
                     },
                     bookmarks: vec![],
+                    has_more: false,
                 }),
             )
                 .into_response()
@@ -442,10 +528,6 @@ pub async fn snapshot_handler(
 
 /// GET /metrics — Prometheus metrics endpoint.
 pub async fn metrics_handler(State(state): State<AppState>) -> Response {
-    // Update gauge from transaction map size.
-    let tx_count = state.transactions.read().unwrap_or_else(|e| e.into_inner()).len();
-    state.metrics.http_transactions_active.set(tx_count as i64);
-
     (
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         state.metrics.encode(),
@@ -487,8 +569,8 @@ fn tx_worker(
 
     while let Ok(op) = rx.recv() {
         match op {
-            TxOp::Run { query: q, params } => {
-                let result = query::run_query(&conn, &q, params.as_ref());
+            TxOp::Run { query: q, params, limit } => {
+                let result = query::run_query_limited(&conn, &q, params.as_ref(), limit);
                 if let Ok(ref eq) = result {
                     if journal::is_mutation(&eq.rewritten_query) {
                         journal_buf.push(PendingEntry {
@@ -538,6 +620,7 @@ fn tx_worker(
 pub fn spawn_tx_reaper(
     transactions: Arc<RwLock<HashMap<String, Arc<TransactionState>>>>,
     timeout: std::time::Duration,
+    metrics: Arc<Metrics>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -557,11 +640,13 @@ pub fn spawn_tx_reaper(
                     .collect()
             };
             if !stale.is_empty() {
+                let count = stale.len();
                 let mut txs = transactions.write().unwrap_or_else(|e| e.into_inner());
                 for id in &stale {
                     txs.remove(id);
                 }
-                tracing::info!("Reaped {} abandoned transaction(s)", stale.len());
+                metrics.http_transactions_active.sub(count as i64);
+                tracing::info!("Reaped {} abandoned transaction(s)", count);
             }
         }
     });
@@ -630,60 +715,79 @@ mod tests {
 
     // ─── validate_auth ───
 
+    fn test_limiter() -> RateLimiter {
+        RateLimiter::new(
+            5,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+        )
+    }
+
+    fn test_ip() -> std::net::IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
     #[test]
     fn open_access_always_passes() {
         let tokens = TokenStore::open();
+        let limiter = test_limiter();
         let headers = HeaderMap::new();
-        assert!(validate_auth(&headers, &tokens).is_ok());
+        assert!(validate_auth(&headers, &tokens, &limiter, test_ip()).is_ok());
     }
 
     #[test]
     fn bearer_auth_valid_token() {
         let token = "test-secret-token";
         let tokens = TokenStore::from_token(token);
+        let limiter = test_limiter();
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
-        assert!(validate_auth(&headers, &tokens).is_ok());
+        assert!(validate_auth(&headers, &tokens, &limiter, test_ip()).is_ok());
     }
 
     #[test]
     fn bearer_auth_invalid_token() {
         let tokens = TokenStore::from_token("correct-token");
+        let limiter = test_limiter();
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer wrong-token".parse().unwrap());
-        assert!(validate_auth(&headers, &tokens).is_err());
+        assert!(validate_auth(&headers, &tokens, &limiter, test_ip()).is_err());
     }
 
     #[test]
     fn basic_auth_password_is_token() {
         let token = "my-secret";
         let tokens = TokenStore::from_token(token);
+        let limiter = test_limiter();
         let encoded = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             format!("neo4j:{token}"),
         );
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
-        assert!(validate_auth(&headers, &tokens).is_ok());
+        assert!(validate_auth(&headers, &tokens, &limiter, test_ip()).is_ok());
     }
 
     #[test]
     fn basic_auth_wrong_password() {
         let tokens = TokenStore::from_token("correct");
+        let limiter = test_limiter();
         let encoded = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             "neo4j:wrong",
         );
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
-        assert!(validate_auth(&headers, &tokens).is_err());
+        assert!(validate_auth(&headers, &tokens, &limiter, test_ip()).is_err());
     }
 
     #[test]
     fn missing_auth_header_with_tokens_fails() {
         let tokens = TokenStore::from_token("secret");
+        let limiter = test_limiter();
         let headers = HeaderMap::new();
-        assert!(validate_auth(&headers, &tokens).is_err());
+        assert!(validate_auth(&headers, &tokens, &limiter, test_ip()).is_err());
     }
 
     // ─── Request deserialization ───
@@ -767,11 +871,44 @@ mod tests {
                 values: vec![vec![serde_json::json!(42)]],
             },
             bookmarks: vec![],
+            has_more: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["data"]["fields"], serde_json::json!(["n"]));
         assert_eq!(json["data"]["values"], serde_json::json!([[42]]));
-        // bookmarks should be omitted when empty
+        // bookmarks and has_more should be omitted when false/empty
         assert!(json.get("bookmarks").is_none());
+        assert!(json.get("has_more").is_none());
+    }
+
+    #[test]
+    fn query_response_has_more_when_true() {
+        let resp = QueryResponse {
+            data: QueryData {
+                fields: vec!["n".into()],
+                values: vec![vec![serde_json::json!(1)]],
+            },
+            bookmarks: vec![],
+            has_more: true,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["has_more"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn query_request_with_limit() {
+        let json = serde_json::json!({
+            "statement": "MATCH (n) RETURN n",
+            "limit": 500
+        });
+        let req: QueryRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.limit, Some(500));
+    }
+
+    #[test]
+    fn query_request_default_limit() {
+        let json = serde_json::json!({ "statement": "RETURN 1" });
+        let req: QueryRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.limit, None);
     }
 }

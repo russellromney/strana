@@ -175,7 +175,11 @@ async fn main() {
 
     let db_dir = config.data_dir.join("db");
     let t0 = std::time::Instant::now();
-    let db = Backend::open(&db_dir).expect("Failed to open database");
+    let mut db = Backend::open(&db_dir).expect("Failed to open database");
+    if config.query_timeout_ms > 0 {
+        db.set_query_timeout_ms(config.query_timeout_ms);
+        info!("Query timeout: {}ms", config.query_timeout_ms);
+    }
     info!("[timing] main: Backend::open: {:?}", t0.elapsed());
 
     // Conditionally start journal writer.
@@ -242,6 +246,14 @@ async fn main() {
     // ── Metrics ──
     let metrics = Arc::new(metrics::Metrics::new());
 
+    // ── Auth rate limiter ──
+    let rate_limiter = Arc::new(auth::RateLimiter::new(
+        config.auth_rate_limit_threshold,
+        Duration::from_millis(config.auth_rate_limit_base_ms),
+        Duration::from_millis(config.auth_rate_limit_max_ms),
+        Duration::from_secs(3600), // 1 hour window
+    ));
+
     // ── Bolt listener ──
     let bolt_state = bolt::BoltState {
         engine: engine.clone(),
@@ -251,6 +263,7 @@ async fn main() {
         )),
         replica: config.replica,
         metrics: metrics.clone(),
+        rate_limiter: rate_limiter.clone(),
     };
 
     // ── Shutdown signal ──
@@ -298,17 +311,31 @@ async fn main() {
         s3_prefix: config.s3_prefix.clone(),
         transactions: Arc::new(std::sync::RwLock::new(HashMap::new())),
         metrics: metrics.clone(),
+        rate_limiter: rate_limiter.clone(),
     };
 
     // ── Transaction reaper ──
     neo4j_http::spawn_tx_reaper(
         http_state.transactions.clone(),
         std::time::Duration::from_secs(config.tx_timeout_secs),
+        metrics.clone(),
     );
     info!(
         "Transaction reaper: enabled (timeout={}s)",
         config.tx_timeout_secs
     );
+
+    // ── Rate limiter cleanup ──
+    {
+        let limiter = rate_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                limiter.cleanup();
+            }
+        });
+    }
 
     if http_state.s3_bucket.is_some() {
         info!(
@@ -342,7 +369,10 @@ async fn main() {
     info!("HTTP listening on {http_addr}");
 
     let http_shutdown = shutdown_rx.clone();
-    axum::serve(listener, app)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(async move {
             http_shutdown.clone().changed().await.ok();
             info!("HTTP listener shutting down");
