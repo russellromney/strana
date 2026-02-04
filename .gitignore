@@ -4,6 +4,11 @@
 /kuzu-patched
 .env*
 
+# Pre-built test fixtures (large DBs cached across runs)
+.test-fixtures/
+__pycache__/
+python/
+
 # E2E test dependencies
 tests/e2e/node_modules/
 tests/e2e/package-lock.json

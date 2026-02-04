@@ -4,6 +4,58 @@ Strategic direction: graphd is an open-source graph database server for AI memor
 
 Key insight: Mem0 and Graphiti both already have Kuzu backends that emit compatible Cypher. We fork those backends to use neo4j-driver over Bolt pointing at graphd. No query translation — LadybugDB IS Kuzu.
 
+## Phase 14: Journal S3 Upload
+
+Journal segments must be uploaded to S3 so S3-based replicas can see writes between snapshots. Currently only snapshots are uploaded — replicas miss any data written after the last snapshot.
+
+**Desired behavior (full spec):**
+1. Every write/schema change → journal (append-only log) ✅
+2. Journal uploaded to S3 at interval ❌ MISSING
+3. Snapshots uploaded to S3 as restore convenience ✅
+4. On restore: latest snapshot + subsequent journal entries ✅
+5. Open snapshot, replay journals earliest→latest ✅
+6. Keep polling S3 for new journal segments ✅
+7. When caught up → Bolt can connect ✅
+8. Keep polling and replaying continuously ✅
+
+Only #2 is missing. The replica download + replay infrastructure already works.
+
+### Design
+
+**New `JournalCommand::SealForUpload`**: Forces the journal writer to seal the current segment (even if not at size limit) so it can be uploaded. Without this, entries sit in the unsealed segment indefinitely for small workloads.
+
+**Background uploader task** (`journal_s3.rs`): Runs every 1s when `--journal` + `--s3-bucket` are both configured. Each cycle:
+1. Send `SealForUpload` → journal writer seals current segment, returns path
+2. Scan journal dir for all sealed `.graphj` files (read 128-byte header, check `FLAG_SEALED`)
+3. Upload each to `{prefix}journal/journal-{seq:016}.graphj`
+
+S3 PutObject is idempotent — re-uploading is harmless, avoids tracking state.
+
+S3 key layout (matches what `poll_and_apply_s3` already expects):
+```
+s3://bucket/{prefix}snapshots/{seq:016}/...   (snapshots)
+s3://bucket/{prefix}journal/journal-{seq:016}.graphj  (journal segments)
+```
+
+### Steps
+
+1. **`journal.rs`**: Add `SealForUpload(SyncSender<Option<PathBuf>>)` to `JournalCommand`. Handle in `writer_loop`: if current segment has entries, seal it, send back path, set `current_file = None`. If empty, send `None`.
+
+2. **`journal_s3.rs`** (new, ~120 lines): `spawn_journal_uploader(journal_tx, journal_dir, bucket, prefix, interval, shutdown_rx)`. Loop: seal → scan sealed files → PutObject each. Uses `graphj::read_header` + `FLAG_SEALED` to detect sealed segments.
+
+3. **`main.rs`**: After journal writer spawn, if S3 configured, spawn uploader. Add `pub mod journal_s3` to `lib.rs`.
+
+4. **Verify**: `test_replica.py::TestReplicaS3Source` passes — Charlie (post-snapshot journal entry) visible to S3 replica.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `src/journal.rs` | Add `SealForUpload` variant + handler (~20 lines) |
+| `src/journal_s3.rs` | NEW: background uploader (~120 lines) |
+| `src/lib.rs` | Add `pub mod journal_s3;` |
+| `src/main.rs` | Spawn uploader when journal + S3 (~10 lines) |
+
 ## Phase 8-hardening: Production Hardening
 
 Security, data safety, and concurrency fixes for Bolt + Neo4j HTTP consolidation.
@@ -994,7 +1046,84 @@ Same approach as Mem0. Fork Graphiti's Kuzu backend, swap kuzu SDK for neo4j-dri
 - `QUERY_FTS_INDEX` for full-text search
 - `CAST()`, `list_concat()`
 
-## Phase 13: Replica Mode
+## Phase 13.6: Fix Unsealed Segment Race Condition
+
+**Problem:** Replica incremental replication has a race condition where unsealed segments can be copied mid-write, resulting in incomplete copies and missing data.
+
+**Current behavior:**
+- Primary appends entries to unsealed segment (e.g., journal-0001.graphj with entries 1-10000)
+- User writes 1000 new entries (10001-11000) to primary
+- Replica polls and copies segment via `std::fs::copy`
+- Copy operation can catch file mid-write (e.g., only 265 of 1000 entries written)
+- Replica replays incomplete copy, database missing 735 entries
+- Next poll copies again, gets more entries (795), but still incomplete
+- Progressive replication: each poll gets closer but never catches up within reasonable time
+
+**Test evidence** ([test_replica.py:test_large_dataset_disk_io](tests/e2e/test_replica.py:982-1126)):
+- Primary writes 11000 nodes total
+- Replica after 4s poll: 10414 nodes (586 missing)
+- Replica after 7s poll: 10795 nodes (205 missing)
+- Expected: 11000 nodes
+
+**Root cause:** [replica.rs:752](src/replica.rs:752) uses `std::fs::copy(&source_file, &dest_file)` without synchronization. No mechanism ensures source file is in consistent state during copy.
+
+**Solution options:**
+
+1. **File locking** (recommended): Use OS-level advisory locks to coordinate between writer and reader
+   ```rust
+   // In journal writer: hold shared lock while appending
+   let _lock = file.try_lock_shared()?;
+   file.write_all(&entry_bytes)?;
+
+   // In replica: acquire exclusive lock before copying
+   let source = File::open(&source_file)?;
+   let _lock = source.try_lock_exclusive()?;
+   std::fs::copy(&source_file, &dest_file)?;
+   ```
+
+2. **Flush coordination**: Add HTTP endpoint to flush journal, replica calls before copying
+   ```rust
+   // Replica before copy:
+   POST /v1/journal/flush → primary flushes and returns
+   std::fs::copy(&source_file, &dest_file)?;
+   ```
+
+3. **Copy with retry**: Detect incomplete copies and retry
+   ```rust
+   loop {
+       let size_before = source_file.metadata()?.len();
+       std::fs::copy(&source_file, &dest_file)?;
+       let size_after = source_file.metadata()?.len();
+       if size_before == size_after { break; }
+       thread::sleep(Duration::from_millis(100));
+   }
+   ```
+
+4. **Atomic copy-on-write**: Use temp file + rename
+   ```rust
+   let temp_file = journal_dir.join(format!("{}.tmp", filename));
+   std::fs::copy(&source_file, &temp_file)?;
+   std::fs::rename(&temp_file, &dest_file)?; // Atomic on Unix
+   ```
+
+**Implementation plan:**
+
+1. Add file locking to journal writer ([journal.rs](src/journal.rs)):
+   - Hold shared lock during entry append
+   - Release after fsync (or periodically for unsealed segments)
+
+2. Add file locking to replica reader ([replica.rs:747-759](src/replica.rs:747-759)):
+   - Acquire exclusive lock on source file before copy
+   - Copy, then release lock
+
+3. Add tests:
+   - Test: concurrent writes during replica copy (should not lose data)
+   - Test: replica copies complete unsealed segment (11000 == 11000)
+   - Test: file locking doesn't block primary writes excessively
+
+**Alternative if file locking is complex:** Implement copy-with-retry (#3) as interim solution, then add file locking later for production.
+
+## Phase 13: Replica Mode (COMPLETE)
 
 Enable graphd to run as a read-only replica that polls cloud storage for updates.
 
@@ -1068,14 +1197,184 @@ Run replicas in multiple regions for low-latency reads:
 - Replica in ap-southeast-1 polls S3, serves Asian reads
 - All replicas eventually consistent (bounded by poll interval + network latency)
 
+### Implementation
+
+**Architecture:**
+```
+Replica Process:
+  1. Initial sync (blocks Bolt server startup)
+     └─ Download snapshot → Extract → Download journals → Replay
+
+  2. Bolt server starts (read-only mode)
+     └─ Serves queries while poller runs in background
+
+  3. Poller loop (tokio task)
+     └─ Every N seconds: List S3 → Download new segments → Replay → Update local journal dir
+```
+
+**Key insight:** Replica emulates primary's journal directory structure locally, then uses existing `JournalReader` for replay. No custom replay logic needed.
+
+**Components:**
+
+1. **`src/replica.rs`** (~400 lines)
+   - `ReplicaConfig`: Parse source URL, poll interval, lag warn threshold
+   - `initial_sync()`: Download snapshot + journals, replay to catch up
+   - `spawn_poller()`: Tokio task that polls S3 on interval
+   - `download_and_apply_segments()`: Download missing .graphj files, replay incrementally
+   - `parse_source_url()`: Support `s3://bucket/prefix` and `file:///path`
+   - Error handling: exponential backoff for network failures, fatal on missing segments
+
+2. **`src/bolt.rs`** modifications (~50 lines)
+   - Add `is_replica: bool` flag to connection state
+   - RUN handler: check `is_mutation(query)`, reject if replica mode
+   - Return `Neo.ClientError.Request.Invalid: Replica is read-only`
+
+3. **`src/main.rs`** modifications (~30 lines)
+   - Check `config.replica` flag before starting Bolt server
+   - Call `replica::initial_sync()` if replica mode
+   - Spawn `replica::spawn_poller()` after Bolt server starts
+   - Pass `is_replica` flag to Bolt handlers
+
+4. **`src/config.rs`** (already done)
+   - Added `--replica`, `--replica-source`, `--replica-poll-interval`, `--replica-lag-warn`
+
+**Hash chain preservation:**
+
+Compacted journal segments preserve full hash chain because each entry contains its `prev_hash` field:
+```
+Unsealed segment: [header][entry1][entry2][entry3]...
+Compacted segment: [header][compressed(encrypted([entry1][entry2][entry3]...))]
+                                        ↑
+                        Each entry still has prev_hash field
+```
+
+On replay:
+1. Reader detects sealed+compressed segment
+2. Decrypts → Decompresses → Gets raw entry bytes
+3. Reads entries with `read_entry_from()` — each has `prev_hash`
+4. Chain validates: `hash(entry[i]) == entry[i+1].prev_hash`
+
+**Error handling:**
+
+```rust
+// Network failure (transient)
+match download_segment(url).await {
+    Err(e) if is_network_error(&e) => {
+        warn!("Network error downloading segment: {e}, retrying...");
+        tokio::time::sleep(backoff_duration).await;
+        continue; // retry with exponential backoff
+    }
+    Err(e) => return Err(format!("Fatal S3 error: {e}")), // permission, auth, etc.
+    Ok(bytes) => bytes,
+}
+
+// Corruption (fatal)
+match JournalReader::from_sequence(...) {
+    Err(e) if e.contains("CRC32C mismatch") => {
+        error!("Corrupted segment detected: {e}");
+        std::process::exit(1); // fatal, cannot continue
+    }
+    Err(e) if e.contains("Chain hash mismatch") => {
+        error!("Chain broken: {e}");
+        std::process::exit(1); // fatal, replica state invalid
+    }
+    ...
+}
+
+// Missing segment (fatal)
+if expected_seq != downloaded_seq {
+    error!("Gap in replication log: expected seq {expected_seq}, got {downloaded_seq}");
+    std::process::exit(1); // fatal, cannot skip writes
+}
+```
+
+**Watermark tracking:**
+
+No separate watermark file needed! Use existing `recover_journal_state()`:
+```rust
+// On startup or after applying segments
+let (last_seq, last_hash) = recover_journal_state(&journal_dir)?;
+// This scans local journal dir, returns last applied sequence
+```
+
+Local journal dir structure matches primary:
+```
+data/
+  db/                     # LadybugDB files (from replay)
+  journal/                # Downloaded .graphj files
+    journal-0000000000000000.graphj
+    journal-0000000000001000.graphj
+```
+
+**S3 layout assumptions:**
+
+Primary uploads to:
+```
+s3://bucket/prefix/snapshots/{sequence:016}.tar.zst
+s3://bucket/prefix/journal/journal-{sequence:016}.graphj
+```
+
+Replica polls:
+```rust
+// List journal segments
+let resp = s3_client.list_objects_v2()
+    .bucket(bucket)
+    .prefix(format!("{}journal/", prefix))
+    .send().await?;
+
+// Find segments with seq > last_local_seq
+for obj in resp.contents() {
+    let key = obj.key()?;
+    let seq = parse_segment_seq_from_key(key)?;
+    if seq > last_local_seq {
+        download_and_apply(bucket, key).await?;
+    }
+}
+```
+
 ### Testing
 
 Integration tests:
 - Primary writes data, replica polls and sees new data
-- Replica rejects write operations
+- Replica rejects write operations (CREATE, SET, DELETE, MERGE)
 - Network failure recovery (primary continues writing, replica catches up when network returns)
 - Snapshot rotation (replica downloads new snapshot, replays incremental journal)
-- Lag monitoring and warnings
+- Compacted journal segments replay correctly with full hash chain validation
+- Lag monitoring and warnings trigger at threshold
+- Fatal errors on corrupted segments and missing sequences
+
+Unit tests:
+- Parse replica source URL (s3://, file://)
+- Duration parsing (5s, 30s, 1m)
+- Exponential backoff calculation
+- Mutation detection (queries with CREATE/SET/DELETE)
+
+### Implementation order
+
+**Phase 1: Read-only enforcement (~1 hour)**
+1. Add `is_replica` flag to Bolt connection state
+2. Check `is_mutation()` in RUN handler, reject if replica
+3. Test: verify writes rejected with correct error
+
+**Phase 2: Initial sync (~3 hours)**
+1. Create `src/replica.rs` with `initial_sync()`
+2. Download latest snapshot from S3
+3. Download journal segments newer than snapshot
+4. Replay using existing `snapshot::restore()`
+5. Test: manual verify replica starts with correct data
+
+**Phase 3: Poller loop (~2 hours)**
+1. Implement `spawn_poller()` tokio task
+2. List S3 journal objects on interval
+3. Download missing segments to local journal dir
+4. Replay incrementally using `JournalReader`
+5. Test: verify replica catches up to new writes
+
+**Phase 4: Error handling & monitoring (~2 hours)**
+1. Exponential backoff for network failures
+2. Fatal errors for corruption and gaps
+3. Lag tracking and warning logs
+4. Test: network failures, corrupted downloads
 
 ## Later
 

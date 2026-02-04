@@ -2,15 +2,16 @@
 
 Neo4j-compatible graph database server powered by embedded LadybugDB (formerly Kuzu).
 
-Exposes LadybugDB over Bolt 4.4 and Neo4j HTTP API. Adds journaling, point-in-time recovery, and S3 backups via new `.graphj` format. Think [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) for graph databases.
+Exposes LadybugDB over Bolt 4.4–5.7 and Neo4j HTTP API. Adds journaling, point-in-time recovery, S3 backups, and read replicas via the `.graphj` format. Think [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) for graph databases.
 
 ## Features
 
-- **Neo4j-compatible**: Bolt 4.4 protocol + Neo4j HTTP API
+- **Neo4j-compatible**: Bolt 4.4–5.7 protocol + Neo4j HTTP API
 - **Fast embedded backend**: LadybugDB (formerly Kuzu)
+- **Read replicas**: S3-based replicas with continuous journal streaming
 - **Logical replication**: GraphJ format with CRC32C + SHA-256 chain hashing
 - **Point-in-time recovery**: Snapshots + journal replay
-- **Compression & encryption**: zstd + XChaCha20-Poly1305 for compacted archives
+- **Compression & encryption**: zstd compress-on-seal + XChaCha20-Poly1305 encryption
 - **S3-compatible backups**: Tigris, R2, Wasabi, MinIO, etc.
 - **Token authentication**: SHA-256 hashed multi-token support
 
@@ -20,7 +21,7 @@ Exposes LadybugDB over Bolt 4.4 and Neo4j HTTP API. Adds journaling, point-in-ti
 ┌─────────────────────────────────────┐
 │  Neo4j Drivers (Python, JS, Go...)  │
 └──────────────┬──────────────────────┘
-               │ Bolt 4.4 / HTTP
+               │ Bolt 4.4–5.7 / HTTP
 ┌──────────────▼──────────────────────┐
 │          graphd (Rust)               │
 │  ┌────────────────────────────────┐ │
@@ -31,8 +32,11 @@ Exposes LadybugDB over Bolt 4.4 and Neo4j HTTP API. Adds journaling, point-in-ti
 │  └────────────┬───────────────────┘ │
 │  ┌────────────▼───────────────────┐ │
 │  │   Journal Writer (.graphj)     │ │
-│  └────────────┬───────────────────┘ │
-│  ┌────────────▼───────────────────┐ │
+│  └──────┬─────────────────────────┘ │
+│         │  ┌───────────────────┐    │
+│         │  │ S3 Journal Upload │───▶ S3
+│         │  └───────────────────┘    │
+│  ┌──────▼─────────────────────────┐ │
 │  │  LadybugDB (embedded Kuzu)     │ │
 │  └────────────────────────────────┘ │
 └─────────────────────────────────────┘
@@ -40,6 +44,11 @@ Exposes LadybugDB over Bolt 4.4 and Neo4j HTTP API. Adds journaling, point-in-ti
          ▼                  ▼
     data/db/          data/journal/
   (LadybugDB)         (.graphj files)
+
+                    ┌─────────────────────┐
+             S3 ◀───│  graphd --replica    │
+                    │  (read-only replica) │
+                    └─────────────────────┘
 ```
 
 ## Requirements
@@ -124,11 +133,20 @@ graphd [OPTIONS]
 |------|-------------|
 | `--restore` | Restore from latest snapshot + replay journal, then exit |
 | `--snapshot <PATH>` | Optional: specific snapshot directory for `--restore` |
-| `--s3-bucket` | S3 bucket name for snapshot downloads/uploads |
+| `--s3-bucket` | S3 bucket name for snapshot/journal uploads |
 | `--s3-prefix` | S3 key prefix (default: `""`) |
 | `--retain-daily` | Keep N daily snapshots (default: 7) |
 | `--retain-weekly` | Keep N weekly snapshots (default: 4) |
 | `--retain-monthly` | Keep N monthly snapshots (default: 3) |
+
+### Replicas
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--replica` | | Enable read-only replica mode |
+| `--replica-source` | | Source URL: `s3://bucket/prefix` or `file:///path` |
+| `--replica-poll-interval` | `10s` | How often to poll for new journal segments |
+| `--replica-lag-warn` | `60s` | Warn if replica falls behind by this duration |
 
 ### Examples
 
@@ -142,25 +160,28 @@ graphd --token my-secret-token
 # With journaling + compression
 graphd --journal --journal-compress
 
-# With S3 snapshots (requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION env vars)
+# Primary with journal + S3 (snapshots + journal segments uploaded continuously)
 export AWS_ACCESS_KEY_ID=your-key
 export AWS_SECRET_ACCESS_KEY=your-secret
 export AWS_REGION=us-east-1
 graphd --journal \
-  --s3-bucket my-snapshots \
-  --s3-prefix prod/ \
-  --retain-daily 7 \
-  --retain-weekly 4
+  --s3-bucket my-graph-bucket \
+  --s3-prefix prod/
 
-# Restore from S3
-graphd --restore --s3-bucket my-snapshots
+# Read replica (polls S3 for new journal segments)
+graphd --replica \
+  --replica-source s3://my-graph-bucket/prod/ \
+  --replica-poll-interval 5s
+
+# Restore from S3 snapshot + journal replay
+graphd --restore --s3-bucket my-graph-bucket --s3-prefix prod/
 ```
 
 ## Neo4j Compatibility
 
 ### Bolt Protocol
 
-`graphd` implements Bolt 4.4 (see [src/bolt/](src/bolt/) for protocol implementation). Use any Neo4j driver:
+`graphd` implements Bolt 4.4–5.7. Use any Neo4j driver:
 
 ```python
 # Python
@@ -182,7 +203,7 @@ driver, _ := neo4j.NewDriverWithContext("bolt://localhost:7687", neo4j.BasicAuth
 
 ### HTTP API
 
-Neo4j HTTP endpoints (see [src/http/](src/http/) for HTTP API implementation, port 7688 by default):
+Neo4j HTTP endpoints (port 7688 by default):
 
 ```bash
 # Execute query
@@ -232,7 +253,7 @@ Token file format (`tokens.json`):
 - **128-byte fixed header**: magic, version, flags, sequence range, checksums, nonce
 - **Variable body**: Raw journal entries or compressed/encrypted payload
 
-Live segments are written **unsealed** (raw, uncompressed). Compaction produces **sealed** files with optional compression and encryption.
+Live segments are written **unsealed** (raw, uncompressed). When sealed (rotation, upload, or shutdown), segments are compressed with zstd. Compaction can additionally apply encryption.
 
 ### Features
 
@@ -270,7 +291,6 @@ See [ROADMAP.md](ROADMAP.md) for planned features including:
 - Serverless SDKs (Python/Node)
 - Additional AI memory framework verification (Cognee)
 - MCP server for LLM integration
-- Embedded read replicas via S3
 
 ## Performance
 

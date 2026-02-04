@@ -805,10 +805,10 @@ async fn test_journal_params_preserved() {
         .filter_map(|e| e.as_ref().ok())
         .find(|e| e.entry.query.contains("JParams") && e.entry.query.contains("$name"))
         .expect("Should find the parameterized CREATE entry");
-    let params_json = graphd::journal::map_entries_to_json(&entry.entry.params);
-    let params = params_json.unwrap();
-    assert_eq!(params["name"], "Alice");
-    assert_eq!(params["age"], 30);
+    let params = graphd::journal::map_entries_to_param_values(&entry.entry.params);
+    let find = |k: &str| params.iter().find(|(key, _)| key == k).unwrap().1.clone();
+    assert_eq!(find("name"), graphd::values::ParamValue::String("Alice".into()));
+    assert_eq!(find("age"), graphd::values::ParamValue::Int(30));
 }
 
 #[tokio::test]
@@ -836,9 +836,16 @@ async fn test_journal_array_params_roundtrip() {
         .filter_map(|e| e.as_ref().ok())
         .find(|e| e.entry.query.contains("JArr") && e.entry.query.contains("$tags"))
         .expect("Should find the parameterized CREATE entry");
-    let params_json = graphd::journal::map_entries_to_json(&entry.entry.params);
-    let params = params_json.unwrap();
-    assert_eq!(params["tags"], json!(["a", "b", "c"]));
+    let params = graphd::journal::map_entries_to_param_values(&entry.entry.params);
+    let find = |k: &str| params.iter().find(|(key, _)| key == k).unwrap().1.clone();
+    assert_eq!(
+        find("tags"),
+        graphd::values::ParamValue::List(vec![
+            graphd::values::ParamValue::String("a".into()),
+            graphd::values::ParamValue::String("b".into()),
+            graphd::values::ParamValue::String("c".into()),
+        ])
+    );
 }
 
 // ─── Snapshot ───

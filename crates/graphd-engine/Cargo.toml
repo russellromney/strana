@@ -1,0 +1,25 @@
+[package]
+name = "graphd-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Graph database engine: query execution, sandboxing, and value types"
+
+[features]
+default = []
+bolt = ["dep:bolt-proto", "dep:bytes"]
+
+[dependencies]
+lbug = { version = "0.14", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+# Bolt protocol (optional, for Neo4j wire protocol support)
+bolt-proto = { git = "https://github.com/russellromney/bolt-rs.git", branch = "bolt-5x-support", optional = true }
+bytes = { version = "1.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

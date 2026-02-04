@@ -983,7 +983,7 @@ class TestGraphdE2E(unittest.TestCase):
     # ── Test 8: Cross-verify S3 objects ──
 
     def test_s3_object_verification(self):
-        """Verify S3 objects exist with correct format and non-zero size."""
+        """Verify S3 objects exist with correct per-file chunked format."""
         s3_env, bucket = load_s3_env()
         if s3_env is None:
             self.skipTest("S3 credentials not available")
@@ -1018,24 +1018,24 @@ class TestGraphdE2E(unittest.TestCase):
         seq = snap_resp["data"]["values"][0][0]
         print(f"  Snapshot taken: seq={seq}")
 
-        # Verify: exactly one tar.zst object under the prefix
+        # Verify per-file chunked format in S3
         objects_after = list_s3_objects(bucket, s3_prefix, s3_env)
-        tarballs = [o for o in objects_after if o["Key"].endswith(".tar.zst")]
-        self.assertEqual(
-            len(tarballs), 1,
-            f"Expected 1 tarball in S3, got {len(tarballs)}: {[o['Key'] for o in tarballs]}",
-        )
+        keys_after = [o["Key"] for o in objects_after]
 
-        tarball = tarballs[0]
-        expected_key = f"{s3_prefix}{seq:016}.tar.zst"
-        self.assertEqual(
-            tarball["Key"], expected_key,
-            f"Expected key '{expected_key}', got '{tarball['Key']}'",
-        )
-        self.assertGreater(tarball["Size"], 0, "Tarball should have non-zero size")
-        print(f"  S3 object: key={tarball['Key']}, size={tarball['Size']} bytes")
+        snap_prefix = f"{s3_prefix}snapshots/{seq:016}"
+        manifests = [k for k in keys_after if k == f"{snap_prefix}/manifest.json"]
+        metas = [k for k in keys_after if k == f"{snap_prefix}/snapshot.meta"]
+        data_files = [k for k in keys_after if "/files/" in k and k.endswith(".zst")]
 
-        # Take second snapshot → should have 2 objects now
+        self.assertEqual(len(manifests), 1, f"Expected manifest.json, got: {manifests}")
+        self.assertEqual(len(metas), 1, f"Expected snapshot.meta, got: {metas}")
+        self.assertGreater(len(data_files), 0, f"Expected at least 1 .zst data file, got: {keys_after}")
+
+        for obj in objects_after:
+            self.assertGreater(obj["Size"], 0, f"Object should have non-zero size: {obj['Key']}")
+        print(f"  Snapshot 1: {len(objects_after)} objects ({len(data_files)} data files)")
+
+        # Take second snapshot → should have two snapshot directories
         with driver.session() as session:
             session.run(
                 "MATCH (p:Person {name: 'Alice'}) SET p.score = 0.55"
@@ -1044,25 +1044,24 @@ class TestGraphdE2E(unittest.TestCase):
         seq2 = snap2["data"]["values"][0][0]
 
         objects_final = list_s3_objects(bucket, s3_prefix, s3_env)
-        tarballs_final = [o for o in objects_final if o["Key"].endswith(".tar.zst")]
-        self.assertEqual(
-            len(tarballs_final), 2,
-            f"Expected 2 tarballs after 2nd snapshot, got {len(tarballs_final)}",
-        )
+        keys_final = [o["Key"] for o in objects_final]
 
-        # Both should have distinct keys and non-zero sizes
-        keys = sorted(o["Key"] for o in tarballs_final)
-        self.assertEqual(len(set(keys)), 2, "Keys should be distinct")
-        for obj in tarballs_final:
-            self.assertGreater(obj["Size"], 0)
+        snap_prefix2 = f"{s3_prefix}snapshots/{seq2:016}"
+        manifests2 = [k for k in keys_final if k == f"{snap_prefix2}/manifest.json"]
+        self.assertEqual(len(manifests2), 1, f"Expected manifest.json for snap2, got: {manifests2}")
+
+        # Both snapshot prefixes should be distinct
+        self.assertNotEqual(snap_prefix, snap_prefix2, "Snapshot prefixes should differ")
+
+        # All objects should be under the test prefix
+        for obj in objects_final:
             self.assertTrue(
                 obj["Key"].startswith(s3_prefix),
                 f"Key should start with prefix: {obj['Key']}",
             )
+            self.assertGreater(obj["Size"], 0)
 
-        # Keys should be lexicographically ordered by sequence
-        self.assertLess(keys[0], keys[1], "Older snapshot key should sort first")
-        print(f"  S3 verification: {len(tarballs_final)} objects, all valid")
+        print(f"  Snapshot 2: {len(objects_final)} total objects")
 
 
 if __name__ == "__main__":

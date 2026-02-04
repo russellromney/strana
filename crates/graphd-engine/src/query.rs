@@ -1,10 +1,10 @@
 use tracing::warn;
 
-use crate::journal::{self, JournalCommand, JournalSender, PendingEntry};
-use crate::values::{self, json_params_to_lbug, json_to_param_values, GraphValue};
+use crate::journal_types::{self, JournalCommand, JournalSender, PendingEntry};
+use crate::values::{self, json_params_to_lbug, GraphValue};
 
 /// Result of executing a query via `run_query_raw`, including journal-relevant info.
-pub(crate) struct RawExecution<'db> {
+pub struct RawExecution<'db> {
     pub query_result: lbug::QueryResult<'db>,
     pub columns: Vec<String>,
     /// The rewritten query (with non-deterministic functions replaced).
@@ -14,6 +14,7 @@ pub(crate) struct RawExecution<'db> {
 }
 
 /// Result of executing a query via `run_query`, with all rows materialized.
+#[derive(Debug)]
 pub struct ExecutedQuery {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<GraphValue>>,
@@ -25,7 +26,7 @@ pub struct ExecutedQuery {
 
 /// Execute a query and return the raw QueryResult, column names, timing,
 /// and the rewritten query + merged params for journaling.
-pub(crate) fn run_query_raw<'db>(
+pub fn run_query_raw<'db>(
     conn: &lbug::Connection<'db>,
     query: &str,
     params: Option<&serde_json::Value>,
@@ -104,7 +105,7 @@ pub(crate) fn take_rows(
 }
 
 /// Execute a single query, collecting all rows.
-pub(crate) fn run_query(
+pub fn run_query(
     conn: &lbug::Connection<'_>,
     query: &str,
     params: Option<&serde_json::Value>,
@@ -120,19 +121,17 @@ pub(crate) fn run_query(
 }
 
 /// Send a journal entry for a successful mutation (no-op if journal is disabled or query is read-only).
-pub(crate) fn journal_entry(
+pub fn journal_entry(
     journal: &Option<JournalSender>,
     query: &str,
     params: &Option<serde_json::Value>,
 ) {
     if let Some(ref tx) = journal {
-        if journal::is_mutation(query) {
-            // Convert JSON params to typed ParamValues at the journal boundary.
-            let typed_params = json_to_param_values(params);
+        if journal_types::is_mutation(query) {
             if tx
                 .send(JournalCommand::Write(PendingEntry {
                     query: query.to_string(),
-                    params: typed_params,
+                    params: params.clone(),
                 }))
                 .is_err()
             {

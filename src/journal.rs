@@ -39,98 +39,77 @@ pub fn is_mutation(query: &str) -> bool {
     false
 }
 
-// ─── Param conversion ───
+// ─── Param conversion (ParamValue ↔ protobuf, no JSON) ───
 
-fn json_value_to_graph_value(v: &serde_json::Value) -> proto::GraphValue {
+use crate::values::ParamValue;
+
+fn param_value_to_graph_value(v: &ParamValue) -> proto::GraphValue {
     use proto::graph_value::Value;
     let value = match v {
-        serde_json::Value::Null => Value::NullValue(proto::NullValue {}),
-        serde_json::Value::Bool(b) => Value::BoolValue(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::IntValue(i)
-            } else if let Some(u) = n.as_u64() {
-                // u64 > i64::MAX can't fit in proto int64. Store as string to
-                // preserve the exact value; lbug will cast on restore if needed.
-                Value::StringValue(u.to_string())
-            } else {
-                Value::FloatValue(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::String(s) => Value::StringValue(s.clone()),
-        serde_json::Value::Array(arr) => Value::ListValue(proto::ListValue {
-            values: arr.iter().map(json_value_to_graph_value).collect(),
-        }),
-        serde_json::Value::Object(map) => Value::MapValue(proto::MapValue {
-            entries: map
-                .iter()
-                .map(|(k, v)| proto::MapEntry {
-                    key: k.clone(),
-                    value: Some(json_value_to_graph_value(v)),
-                })
-                .collect(),
+        ParamValue::Null => Value::NullValue(proto::NullValue {}),
+        ParamValue::Bool(b) => Value::BoolValue(*b),
+        ParamValue::Int(i) => Value::IntValue(*i),
+        ParamValue::Float(f) => Value::FloatValue(*f),
+        ParamValue::String(s) => Value::StringValue(s.clone()),
+        ParamValue::List(items) => Value::ListValue(proto::ListValue {
+            values: items.iter().map(param_value_to_graph_value).collect(),
         }),
     };
     proto::GraphValue { value: Some(value) }
 }
 
-pub fn json_to_map_entries(params: &Option<serde_json::Value>) -> Vec<proto::MapEntry> {
-    match params {
-        Some(serde_json::Value::Object(map)) => map
-            .iter()
-            .map(|(k, v)| proto::MapEntry {
-                key: k.clone(),
-                value: Some(json_value_to_graph_value(v)),
-            })
-            .collect(),
-        _ => vec![],
-    }
+pub fn param_values_to_map_entries(params: &[(String, ParamValue)]) -> Vec<proto::MapEntry> {
+    params
+        .iter()
+        .map(|(k, v)| proto::MapEntry {
+            key: k.clone(),
+            value: Some(param_value_to_graph_value(v)),
+        })
+        .collect()
 }
 
-fn graph_value_to_json(gv: &proto::GraphValue) -> serde_json::Value {
+fn graph_value_to_param_value(gv: &proto::GraphValue) -> ParamValue {
     match gv.value.as_ref() {
-        Some(proto::graph_value::Value::NullValue(_)) | None => serde_json::Value::Null,
-        Some(proto::graph_value::Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(proto::graph_value::Value::IntValue(i)) => serde_json::json!(*i),
-        Some(proto::graph_value::Value::FloatValue(f)) => serde_json::json!(*f),
-        Some(proto::graph_value::Value::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(proto::graph_value::Value::NullValue(_)) | None => ParamValue::Null,
+        Some(proto::graph_value::Value::BoolValue(b)) => ParamValue::Bool(*b),
+        Some(proto::graph_value::Value::IntValue(i)) => ParamValue::Int(*i),
+        Some(proto::graph_value::Value::FloatValue(f)) => ParamValue::Float(*f),
+        Some(proto::graph_value::Value::StringValue(s)) => ParamValue::String(s.clone()),
         Some(proto::graph_value::Value::ListValue(list)) => {
-            serde_json::Value::Array(list.values.iter().map(graph_value_to_json).collect())
+            ParamValue::List(list.values.iter().map(graph_value_to_param_value).collect())
         }
-        Some(proto::graph_value::Value::MapValue(map)) => {
-            let mut obj = serde_json::Map::new();
-            for entry in &map.entries {
-                obj.insert(entry.key.clone(), entry.value.as_ref().map_or(serde_json::Value::Null, graph_value_to_json));
-            }
-            serde_json::Value::Object(obj)
-        }
-        _ => serde_json::Value::Null,
+        // Map values in proto → flatten to string fallback (params don't use maps).
+        _ => ParamValue::Null,
     }
 }
 
-pub fn map_entries_to_json(entries: &[proto::MapEntry]) -> Option<serde_json::Value> {
-    if entries.is_empty() {
-        return None;
-    }
-    let mut map = serde_json::Map::new();
-    for entry in entries {
-        let value = entry.value.as_ref().map_or(serde_json::Value::Null, graph_value_to_json);
-        map.insert(entry.key.clone(), value);
-    }
-    Some(serde_json::Value::Object(map))
+pub fn map_entries_to_param_values(entries: &[proto::MapEntry]) -> Vec<(String, ParamValue)> {
+    entries
+        .iter()
+        .map(|e| {
+            let value = e
+                .value
+                .as_ref()
+                .map_or(ParamValue::Null, graph_value_to_param_value);
+            (e.key.clone(), value)
+        })
+        .collect()
 }
 
 // ─── Types ───
 
 pub struct PendingEntry {
     pub query: String,
-    pub params: Option<serde_json::Value>,
+    pub params: Vec<(String, ParamValue)>,
 }
 
 #[allow(dead_code)]
 pub enum JournalCommand {
     Write(PendingEntry),
     Flush(std::sync::mpsc::SyncSender<()>),
+    /// Force-seal the current segment so it can be uploaded to S3.
+    /// Returns the path of the sealed segment, or None if no active segment.
+    SealForUpload(std::sync::mpsc::SyncSender<Option<std::path::PathBuf>>),
     Shutdown,
 }
 
@@ -256,32 +235,55 @@ pub fn spawn_journal_writer(
     tx
 }
 
-/// Seal a .graphj segment: rewrite header with SEALED flag + final values.
+/// Zstd compression level for sealed journal segments.
+const JOURNAL_ZSTD_LEVEL: i32 = 3;
+
+/// Seal a .graphj segment: compress body with zstd, rewrite header with
+/// SEALED + COMPRESSED flags + final values.
 fn seal_segment(
     file: &mut File,
     first_seq: u64,
     last_seq: u64,
     entry_count: u64,
-    body_len: u64,
-    body_hasher: Sha256,
+    _body_len: u64,
+    _body_hasher: Sha256,
     created_ms: i64,
 ) -> io::Result<()> {
-    let body_checksum: [u8; 32] = body_hasher.finalize().into();
+    // Read the raw body (everything after the 128-byte header).
+    let file_len = file.seek(SeekFrom::End(0))?;
+    let raw_body_len = file_len - crate::graphj::HEADER_SIZE as u64;
+    file.seek(SeekFrom::Start(crate::graphj::HEADER_SIZE as u64))?;
+    let mut raw_body = vec![0u8; raw_body_len as usize];
+    file.read_exact(&mut raw_body)?;
+
+    // Compress with zstd.
+    let compressed = zstd::encode_all(raw_body.as_slice(), JOURNAL_ZSTD_LEVEL)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd compress: {e}")))?;
+
+    // Checksum of the compressed body (what's stored on disk).
+    let mut hasher = Sha256::new();
+    hasher.update(&compressed);
+    let body_checksum: [u8; 32] = hasher.finalize().into();
+
     let header = crate::graphj::GraphjHeader {
-        flags: crate::graphj::FLAG_SEALED,
-        compression: crate::graphj::COMPRESSION_NONE,
+        flags: crate::graphj::FLAG_SEALED | crate::graphj::FLAG_COMPRESSED,
+        compression: crate::graphj::COMPRESSION_ZSTD,
         encryption: crate::graphj::ENCRYPTION_NONE,
-        zstd_level: 0,
+        zstd_level: JOURNAL_ZSTD_LEVEL,
         first_seq,
         last_seq,
         entry_count,
-        body_len,
+        body_len: compressed.len() as u64,
         body_checksum,
         nonce: [0u8; 24],
         created_ms,
     };
+
+    // Rewrite: header + compressed body, then truncate.
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&crate::graphj::encode_header(&header))?;
+    file.write_all(&compressed)?;
+    file.set_len(crate::graphj::HEADER_SIZE as u64 + compressed.len() as u64)?;
     file.sync_all()?;
     Ok(())
 }
@@ -313,7 +315,7 @@ fn writer_loop(
                 let proto_entry = proto::JournalEntry {
                     sequence: new_seq,
                     query: entry.query,
-                    params: json_to_map_entries(&entry.params),
+                    params: param_values_to_map_entries(&entry.params),
                     timestamp_ms: current_timestamp_ms(),
                 };
                 let payload = proto_entry.encode_to_vec();
@@ -347,9 +349,9 @@ fn writer_loop(
                         }
                     }
 
-                    // Create new .graphj segment.
+                    // Create new .graphj segment (read+write so seal_segment can read body).
                     let path = journal_dir.join(format!("journal-{new_seq:016}.graphj"));
-                    match File::create(&path) {
+                    match File::options().read(true).write(true).create(true).truncate(true).open(&path) {
                         Ok(mut f) => {
                             // Write unsealed header.
                             let header = crate::graphj::GraphjHeader::new_unsealed(
@@ -360,6 +362,7 @@ fn writer_loop(
                                 error!("Failed to write .graphj header: {e}");
                                 continue;
                             }
+
                             info!("Journal: opened segment {}", path.display());
                             current_file = Some(f);
                             current_size = crate::graphj::HEADER_SIZE as u64;
@@ -376,6 +379,8 @@ fn writer_loop(
                 }
 
                 let file = current_file.as_mut().unwrap();
+
+                // Shared lock already held from file creation; write safely.
                 if let Err(e) = file.write_all(&buf) {
                     error!("Journal write error at seq {new_seq}: {e}");
                     // State NOT updated — next write retries with same sequence.
@@ -400,6 +405,43 @@ fn writer_loop(
                     let _ = f.sync_all();
                 }
                 let _ = ack.send(());
+            }
+            Ok(JournalCommand::SealForUpload(ack)) => {
+                if let Some(ref mut f) = current_file {
+                    if let Some(hasher) = body_hasher.take() {
+                        let body_len = current_size - crate::graphj::HEADER_SIZE as u64;
+                        if let Err(e) = seal_segment(
+                            f,
+                            segment_first_seq,
+                            segment_last_seq,
+                            segment_entry_count,
+                            body_len,
+                            hasher,
+                            current_timestamp_ms(),
+                        ) {
+                            error!("Failed to seal segment for upload: {e}");
+                            let _ = ack.send(None);
+                            continue;
+                        }
+                        let path = journal_dir.join(format!(
+                            "journal-{:016}.graphj",
+                            segment_first_seq
+                        ));
+                        info!("Journal: sealed segment for upload: {}", path.display());
+                        let _ = ack.send(Some(path));
+                        // Clear current file so next write opens a new segment.
+                        current_file = None;
+                        current_size = 0;
+                        segment_first_seq = 0;
+                        segment_last_seq = 0;
+                        segment_entry_count = 0;
+                    } else {
+                        // No hasher means segment was already sealed or empty header only.
+                        let _ = ack.send(None);
+                    }
+                } else {
+                    let _ = ack.send(None);
+                }
             }
             Ok(JournalCommand::Shutdown) => {
                 if let Some(ref mut f) = current_file {
@@ -707,15 +749,9 @@ pub fn recover_journal_state(journal_dir: &Path) -> Result<(u64, [u8; 32]), Stri
         let mut file = File::open(segment_path)
             .map_err(|e| format!("Failed to open segment {}: {e}", segment_path.display()))?;
 
-        // Detect .graphj format and skip header if present.
-        let is_graphj = match crate::graphj::read_header(&mut file) {
-            Ok(Some(_hdr)) => true,  // reader is now at offset 128
-            Ok(None) => {
-                // Legacy .wal — seek back to 0.
-                file.seek(SeekFrom::Start(0))
-                    .map_err(|e| format!("Failed to seek: {e}"))?;
-                false
-            }
+        // Detect .graphj format and read header.
+        let hdr_opt = match crate::graphj::read_header(&mut file) {
+            Ok(hdr) => hdr, // reader is now at offset 128 if Some
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 error!(
                     "Skipping corrupted .graphj file (truncated header): {}",
@@ -725,19 +761,45 @@ pub fn recover_journal_state(journal_dir: &Path) -> Result<(u64, [u8; 32]), Stri
             }
             Err(e) => return Err(format!("Failed to read {}: {e}", segment_path.display())),
         };
-        let _ = is_graphj; // used for clarity, reader position is what matters
 
+        if let Some(ref hdr) = hdr_opt {
+            if hdr.is_sealed() && hdr.is_compressed() {
+                // Compressed segment: decode body into memory, read entries from cursor.
+                let mut body = vec![0u8; hdr.body_len as usize];
+                file.read_exact(&mut body)
+                    .map_err(|e| format!("Failed to read compressed body: {e}"))?;
+                let raw = crate::graphj::decode_body(hdr, &body, None)?;
+                let mut cursor = io::Cursor::new(raw);
+                loop {
+                    match read_entry_from(&mut cursor) {
+                        Ok(Some(decoded)) => {
+                            let mut hasher = Sha256::new();
+                            hasher.update(decoded.prev_hash);
+                            hasher.update(&decoded.payload);
+                            running_hash = hasher.finalize().into();
+                            last_seq = decoded.sequence;
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(format!("Error reading journal during recovery: {e}")),
+                    }
+                }
+                continue;
+            }
+        } else {
+            // Legacy .wal — seek back to 0.
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| format!("Failed to seek: {e}"))?;
+        }
+
+        // Unsealed .graphj or legacy .wal: read entries directly from file.
         let mut reader = BufReader::new(file);
-
         loop {
             match read_entry_from(&mut reader) {
                 Ok(Some(decoded)) => {
                     let mut hasher = Sha256::new();
                     hasher.update(decoded.prev_hash);
                     hasher.update(&decoded.payload);
-                    let new_hash: [u8; 32] = hasher.finalize().into();
-
-                    running_hash = new_hash;
+                    running_hash = hasher.finalize().into();
                     last_seq = decoded.sequence;
                 }
                 Ok(None) => break, // EOF
@@ -824,15 +886,18 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_map_entries_empty() {
-        assert!(json_to_map_entries(&None).is_empty());
-        assert!(json_to_map_entries(&Some(serde_json::json!({}))).is_empty());
+    fn test_param_values_to_map_entries_empty() {
+        assert!(param_values_to_map_entries(&[]).is_empty());
     }
 
     #[test]
-    fn test_json_to_map_entries_values() {
-        let params = Some(serde_json::json!({"name": "Alice", "age": 30, "active": true}));
-        let entries = json_to_map_entries(&params);
+    fn test_param_values_to_map_entries_values() {
+        let params = vec![
+            ("name".into(), ParamValue::String("Alice".into())),
+            ("age".into(), ParamValue::Int(30)),
+            ("active".into(), ParamValue::Bool(true)),
+        ];
+        let entries = param_values_to_map_entries(&params);
         assert_eq!(entries.len(), 3);
         let find = |k: &str| entries.iter().find(|e| e.key == k).unwrap();
         match find("name").value.as_ref().unwrap().value.as_ref().unwrap() {
@@ -846,16 +911,20 @@ mod tests {
     }
 
     #[test]
-    fn test_map_entries_to_json_empty() {
-        assert!(map_entries_to_json(&[]).is_none());
+    fn test_map_entries_to_param_values_empty() {
+        assert!(map_entries_to_param_values(&[]).is_empty());
     }
 
     #[test]
     fn test_param_conversion_roundtrip() {
-        let original = serde_json::json!({"x": 42, "y": "hello", "z": true});
-        let entries = json_to_map_entries(&Some(original.clone()));
-        let back = map_entries_to_json(&entries).unwrap();
-        assert_eq!(original, back);
+        let params = vec![
+            ("x".into(), ParamValue::Int(42)),
+            ("y".into(), ParamValue::String("hello".into())),
+            ("z".into(), ParamValue::Bool(true)),
+        ];
+        let entries = param_values_to_map_entries(&params);
+        let back = map_entries_to_param_values(&entries);
+        assert_eq!(params, back);
     }
 
     #[test]
@@ -912,7 +981,7 @@ mod tests {
         for i in 1..=3 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("CREATE (:T {{id: {i}}})"),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }
@@ -945,12 +1014,12 @@ mod tests {
 
         tx.send(JournalCommand::Write(PendingEntry {
             query: "q1".into(),
-            params: None,
+            params: vec![],
         }))
         .unwrap();
         tx.send(JournalCommand::Write(PendingEntry {
             query: "q2".into(),
-            params: None,
+            params: vec![],
         }))
         .unwrap();
 
@@ -980,7 +1049,7 @@ mod tests {
         for _ in 1..=5 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("CREATE (:Big {{data: '{}'}})", "x".repeat(50)),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }
@@ -1022,7 +1091,7 @@ mod tests {
 
         tx.send(JournalCommand::Write(PendingEntry {
             query: "q1".into(),
-            params: None,
+            params: vec![],
         }))
         .unwrap();
 
@@ -1063,7 +1132,7 @@ mod tests {
         for i in 1..=5 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("q{i}"),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }
@@ -1093,7 +1162,10 @@ mod tests {
 
         tx.send(JournalCommand::Write(PendingEntry {
             query: "CREATE (:Foo {name: $_uuid_0})".into(),
-            params: Some(serde_json::json!({"_uuid_0": "abc-123", "user_param": 42})),
+            params: vec![
+                ("_uuid_0".into(), ParamValue::String("abc-123".into())),
+                ("user_param".into(), ParamValue::Int(42)),
+            ],
         }))
         .unwrap();
 
@@ -1106,9 +1178,10 @@ mod tests {
         let reader = JournalReader::open(&journal_dir).unwrap();
         let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(entries.len(), 1);
-        let params = map_entries_to_json(&entries[0].entry.params).unwrap();
-        assert_eq!(params["_uuid_0"], "abc-123");
-        assert_eq!(params["user_param"], 42);
+        let params = map_entries_to_param_values(&entries[0].entry.params);
+        let find = |k: &str| params.iter().find(|(key, _)| key == k).unwrap().1.clone();
+        assert_eq!(find("_uuid_0"), ParamValue::String("abc-123".into()));
+        assert_eq!(find("user_param"), ParamValue::Int(42));
     }
 
     #[test]
@@ -1123,7 +1196,7 @@ mod tests {
 
         tx.send(JournalCommand::Write(PendingEntry {
             query: "q1".into(),
-            params: None,
+            params: vec![],
         }))
         .unwrap();
 
@@ -1135,7 +1208,7 @@ mod tests {
 
         tx.send(JournalCommand::Write(PendingEntry {
             query: "q2".into(),
-            params: None,
+            params: vec![],
         }))
         .unwrap();
 
@@ -1181,7 +1254,7 @@ mod tests {
         for i in 1..=3 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("CREATE (:T {{id: {i}}})"),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }
@@ -1216,7 +1289,7 @@ mod tests {
         for _ in 1..=5 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("CREATE (:Big {{data: '{}'}})", "x".repeat(50)),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }
@@ -1255,7 +1328,7 @@ mod tests {
         for i in 1..=3 {
             tx1.send(JournalCommand::Write(PendingEntry {
                 query: format!("q{i}"),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }
@@ -1275,7 +1348,7 @@ mod tests {
         for i in 4..=6 {
             tx2.send(JournalCommand::Write(PendingEntry {
                 query: format!("q{i}"),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }
@@ -1297,34 +1370,39 @@ mod tests {
 
     #[test]
     fn test_param_array_roundtrip() {
-        let original = serde_json::json!({
-            "tags": ["a", "b", "c"],
-            "embedding": [0.1, 0.2, 0.3],
-            "ids": [1, 2, 3]
-        });
-        let entries = json_to_map_entries(&Some(original.clone()));
-        let back = map_entries_to_json(&entries).unwrap();
-        assert_eq!(original, back);
+        let params = vec![
+            ("tags".into(), ParamValue::List(vec![
+                ParamValue::String("a".into()),
+                ParamValue::String("b".into()),
+                ParamValue::String("c".into()),
+            ])),
+            ("embedding".into(), ParamValue::List(vec![
+                ParamValue::Float(0.1),
+                ParamValue::Float(0.2),
+                ParamValue::Float(0.3),
+            ])),
+            ("ids".into(), ParamValue::List(vec![
+                ParamValue::Int(1),
+                ParamValue::Int(2),
+                ParamValue::Int(3),
+            ])),
+        ];
+        let entries = param_values_to_map_entries(&params);
+        let back = map_entries_to_param_values(&entries);
+        assert_eq!(params, back);
     }
 
     #[test]
     fn test_param_nested_array_roundtrip() {
-        let original = serde_json::json!({
-            "matrix": [[1, 2], [3, 4]]
-        });
-        let entries = json_to_map_entries(&Some(original.clone()));
-        let back = map_entries_to_json(&entries).unwrap();
-        assert_eq!(original, back);
-    }
-
-    #[test]
-    fn test_param_map_roundtrip() {
-        let original = serde_json::json!({
-            "attrs": {"color": "red", "count": 5}
-        });
-        let entries = json_to_map_entries(&Some(original.clone()));
-        let back = map_entries_to_json(&entries).unwrap();
-        assert_eq!(original, back);
+        let params = vec![
+            ("matrix".into(), ParamValue::List(vec![
+                ParamValue::List(vec![ParamValue::Int(1), ParamValue::Int(2)]),
+                ParamValue::List(vec![ParamValue::Int(3), ParamValue::Int(4)]),
+            ])),
+        ];
+        let entries = param_values_to_map_entries(&params);
+        let back = map_entries_to_param_values(&entries);
+        assert_eq!(params, back);
     }
 
     #[test]
@@ -1339,7 +1417,7 @@ mod tests {
         for i in 1..=5 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("CREATE (:T {{id: {i}, data: '{}'}})", "x".repeat(50)),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }

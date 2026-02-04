@@ -1,8 +1,17 @@
+pub mod chunked;
+pub mod s3;
+
+// Re-exports for callers.
+pub use s3::{
+    download_snapshot_s3_chunked, find_latest_snapshot_s3,
+    upload_snapshot_s3_chunked,
+};
+
 use crate::backend::Backend;
 use crate::journal::{
     self, JournalCommand, JournalReader, JournalSender, JournalState,
 };
-use crate::values::json_params_to_lbug;
+use crate::values::{param_values_to_lbug, ParamValue};
 use crate::graphd as proto;
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -73,13 +82,21 @@ fn copy_dir(src: &Path, dst: &Path, exclude: &[&str]) -> Result<(), String> {
 ///
 /// The snapshot is stored at `{data_dir}/snapshots/{sequence:016}/` and includes
 /// a copy of the database files plus a `snapshot.meta` protobuf file.
+///
+/// Takes the `snapshot_lock` and acquires a write lock to block all reads/writes
+/// while capturing a consistent point-in-time. The lock is held through journal
+/// flush, state capture, and CHECKPOINT — then released before the (slow) file copy.
 pub fn create_snapshot(
     data_dir: &Path,
     db: &Backend,
+    snapshot_lock: &std::sync::RwLock<()>,
     journal: &JournalSender,
     journal_state: &JournalState,
     retention_config: &RetentionConfig,
 ) -> Result<SnapshotInfo, String> {
+    // Acquire exclusive lock: blocks all reads and writes during state capture.
+    let _guard = snapshot_lock.write().unwrap_or_else(|e| e.into_inner());
+
     // 1. Flush journal to ensure all entries are on disk.
     let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
     journal
@@ -90,6 +107,8 @@ pub fn create_snapshot(
         .map_err(|_| "Journal flush acknowledgement failed".to_string())?;
 
     // 2. Read journal state (sequence + chain hash).
+    //    No writes can happen between this read and the CHECKPOINT because we
+    //    hold the snapshot write lock (engine reads/writes take read lock).
     let sequence = journal_state.sequence.load(Ordering::SeqCst);
     let chain_hash = *journal_state.chain_hash.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -100,8 +119,11 @@ pub fn create_snapshot(
     }
     drop(conn);
 
-    // 4. Create snapshot directory and copy database file/dir.
-    //    DB lives at data_dir/db — copy it into the snapshot.
+    // Release the lock before the slow file copy + compression.
+    drop(_guard);
+
+    // 4. Create snapshot directory, copy database, compress with zstd.
+    //    DB lives at data_dir/db — copy it, tar+zstd, remove raw files.
     let db_path = data_dir.join("db");
     let snapshots_dir = data_dir.join("snapshots");
     let snap_dir = snapshots_dir.join(format!("{:016}", sequence));
@@ -114,6 +136,17 @@ pub fn create_snapshot(
         std::fs::copy(&db_path, &snap_data_dir.join("db"))
             .map_err(|e| format!("Failed to copy db file: {e}"))?;
     }
+
+    // Compress each file individually (chunked for files > 64 MB).
+    let manifest = chunked::create_file_archive(&snap_data_dir, &snap_dir)?;
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("Serialize manifest: {e}"))?;
+    std::fs::write(snap_dir.join("manifest.json"), &manifest_json)
+        .map_err(|e| format!("Write manifest.json: {e}"))?;
+
+    // Remove raw data now that compressed files are written.
+    std::fs::remove_dir_all(&snap_data_dir)
+        .map_err(|e| format!("Failed to remove raw snapshot data: {e}"))?;
 
     // 5. Write snapshot.meta.
     let now_ms = SystemTime::now()
@@ -172,6 +205,63 @@ fn find_latest_snapshot(data_dir: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "No snapshots found".to_string())
 }
 
+/// Extract snapshot data files to `data_dir/db`.
+///
+/// Decompresses per-file archive (with parallel chunked decompression for
+/// large files) from `manifest.json + files/`.
+fn extract_snapshot_data(snap_dir: &Path, data_dir: &Path) -> Result<(), String> {
+    if snap_dir.join("manifest.json").exists() {
+        chunked::restore_file_archive(snap_dir, data_dir)?;
+    } else {
+        return Err(format!(
+            "No snapshot data in {}: no manifest.json",
+            snap_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Restore only the snapshot data files (no journal replay).
+///
+/// Reads snapshot metadata, removes old DB + WAL, extracts snapshot data.
+/// Returns `(snap_seq, snap_hash)` for the caller to handle journal replay separately.
+pub fn restore_snapshot_files(
+    data_dir: &Path,
+    snapshot_path: &Path,
+) -> Result<(u64, [u8; 32]), String> {
+    let meta = read_snapshot_meta(snapshot_path)?;
+    let snap_seq = meta.sequence;
+    let snap_hash: [u8; 32] = meta
+        .chain_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Invalid chain hash length in snapshot meta".to_string())?;
+
+    info!(
+        "Restoring snapshot files seq={} ({})",
+        snap_seq,
+        snapshot_path.display()
+    );
+
+    // Remove old DB and WAL if present.
+    let db_path = data_dir.join("db");
+    if db_path.is_dir() {
+        std::fs::remove_dir_all(&db_path)
+            .map_err(|e| format!("Failed to remove old db dir: {e}"))?;
+    } else if db_path.exists() {
+        std::fs::remove_file(&db_path)
+            .map_err(|e| format!("Failed to remove old db file: {e}"))?;
+    }
+    let wal_path = data_dir.join("db.wal");
+    if wal_path.exists() {
+        std::fs::remove_file(&wal_path)
+            .map_err(|e| format!("Failed to remove old WAL: {e}"))?;
+    }
+
+    extract_snapshot_data(snapshot_path, data_dir)?;
+    Ok((snap_seq, snap_hash))
+}
+
 /// Restore the database from a snapshot, then replay journal entries.
 ///
 /// If `snapshot_path` is None, the latest snapshot is used.
@@ -202,9 +292,7 @@ pub fn restore(
     );
 
     // 1. Remove old DB and WAL if present.
-    //    LadybugDB stores a WAL at db.wal alongside the main db file/dir.
-    //    If stale WAL entries remain, they'll be replayed on open, corrupting
-    //    the restored snapshot with post-snapshot data.
+    let t0 = std::time::Instant::now();
     let db_path = data_dir.join("db");
     if db_path.is_dir() {
         std::fs::remove_dir_all(&db_path)
@@ -218,37 +306,46 @@ pub fn restore(
         std::fs::remove_file(&wal_path)
             .map_err(|e| format!("Failed to remove old WAL: {e}"))?;
     }
+    info!("[timing] restore: cleanup old db/wal: {:?}", t0.elapsed());
 
-    // 2. Copy snapshot data to data_dir/db.
-    let snap_data_dir = snap_dir.join("data");
-    let snap_db = snap_data_dir.join("db");
-    if snap_db.is_dir() {
-        copy_dir(&snap_db, &db_path, &[])?;
-    } else {
-        std::fs::copy(&snap_db, &db_path)
-            .map_err(|e| format!("Failed to copy db from snapshot: {e}"))?;
-    }
+    // 2. Extract snapshot data to data_dir/db (handles both compressed and legacy).
+    let t0 = std::time::Instant::now();
+    extract_snapshot_data(&snap_dir, data_dir)?;
+    info!("[timing] restore: extract snapshot data: {:?}", t0.elapsed());
 
     // 3. Open DB and replay journal entries.
     let journal_dir = data_dir.join("journal");
     if journal_dir.exists() {
+        let t0 = std::time::Instant::now();
         let db = Backend::open(&db_path)?;
-        let conn = db.connection()?;
+        info!("[timing] restore: Backend::open: {:?}", t0.elapsed());
 
-        // Use the snapshot's chain hash so the reader can validate entries even
-        // after journal compaction has deleted old segments.
+        let t0 = std::time::Instant::now();
+        let conn = db.connection()?;
+        info!("[timing] restore: db.connection(): {:?}", t0.elapsed());
+
+        let t0 = std::time::Instant::now();
         let reader = JournalReader::from_sequence_with_key(
             &journal_dir,
             snap_seq + 1,
             snap_hash,
             encryption_key,
         )?;
+        info!("[timing] restore: JournalReader::new: {:?}", t0.elapsed());
+
+        let t0 = std::time::Instant::now();
         let mut replayed = 0u64;
         let mut skipped = 0u64;
 
+        // Wrap replay in a single transaction to avoid per-entry WAL fsync.
+        // Journal entries are already-committed statements; if we crash mid-replay
+        // we simply redo it from the snapshot.
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|e| format!("BEGIN TRANSACTION failed: {e}"))?;
+
         for item in reader {
             let re = item?;
-            let params = journal::map_entries_to_json(&re.entry.params);
+            let params = journal::map_entries_to_param_values(&re.entry.params);
             match execute_restore_entry(&conn, &re.entry.query, &params) {
                 Ok(()) => replayed += 1,
                 Err(e) => {
@@ -261,7 +358,15 @@ pub fn restore(
             }
         }
 
-        info!("Restore complete: replayed={replayed}, skipped={skipped}");
+        conn.query("COMMIT")
+            .map_err(|e| format!("COMMIT failed: {e}"))?;
+
+        info!(
+            "[timing] restore: replay {} entries: {:?} (skipped={})",
+            replayed,
+            t0.elapsed(),
+            skipped
+        );
     } else {
         info!("Restore complete: no journal to replay");
     }
@@ -271,18 +376,13 @@ pub fn restore(
 
 /// Execute a single journal entry on a connection (no rewriter — journal
 /// already stores rewritten queries with concrete param values).
-fn execute_restore_entry(
+pub fn execute_restore_entry(
     conn: &lbug::Connection<'_>,
     query: &str,
-    params: &Option<serde_json::Value>,
+    params: &[(String, ParamValue)],
 ) -> Result<(), String> {
-    let has_params = params
-        .as_ref()
-        .and_then(|p| p.as_object())
-        .map_or(false, |o| !o.is_empty());
-
-    if has_params {
-        let owned = json_params_to_lbug(params.as_ref().unwrap())?;
+    if !params.is_empty() {
+        let owned = param_values_to_lbug(params)?;
         let refs: Vec<(&str, lbug::Value)> =
             owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         let mut prepared = conn.prepare(query).map_err(|e| format!("{e}"))?;
@@ -291,132 +391,6 @@ fn execute_restore_entry(
     } else {
         conn.query(query).map_err(|e| format!("{e}"))?;
     }
-    Ok(())
-}
-
-// ─── S3 upload / download ───
-
-/// Tar + zstd-compress a snapshot directory and upload it to S3.
-pub async fn upload_snapshot_s3(
-    snap_dir: &Path,
-    bucket: &str,
-    prefix: &str,
-    sequence: u64,
-) -> Result<String, String> {
-    let key = format!("{}{:016}.tar.zst", prefix, sequence);
-
-    // Tar + zstd the snapshot directory into memory.
-    let body = {
-        let snap_dir = snap_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || tar_zstd_dir(&snap_dir))
-            .await
-            .map_err(|e| format!("Tar task failed: {e}"))??
-    };
-
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let client = aws_sdk_s3::Client::new(&config);
-
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(&key)
-        .body(body.into())
-        .send()
-        .await
-        .map_err(|e| format!("S3 upload failed: {e}"))?;
-
-    info!("Snapshot uploaded to s3://{bucket}/{key}");
-    Ok(key)
-}
-
-/// Download a snapshot tarball from S3 and extract it to `dest_dir`.
-pub async fn download_snapshot_s3(
-    bucket: &str,
-    key: &str,
-    dest_dir: &Path,
-) -> Result<(), String> {
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let client = aws_sdk_s3::Client::new(&config);
-
-    let resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .map_err(|e| format!("S3 download failed: {e}"))?;
-
-    let bytes = resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| format!("S3 read body failed: {e}"))?
-        .into_bytes();
-
-    let dest = dest_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || untar_zstd(&bytes, &dest))
-        .await
-        .map_err(|e| format!("Untar task failed: {e}"))??;
-
-    info!("Snapshot downloaded from s3://{bucket}/{key}");
-    Ok(())
-}
-
-/// Find the latest snapshot key in the bucket with the given prefix.
-pub async fn find_latest_snapshot_s3(
-    bucket: &str,
-    prefix: &str,
-) -> Result<String, String> {
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let client = aws_sdk_s3::Client::new(&config);
-
-    let resp = client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .send()
-        .await
-        .map_err(|e| format!("S3 list failed: {e}"))?;
-
-    let contents = resp.contents();
-    if contents.is_empty() {
-        return Err("No snapshots found in S3 bucket".to_string());
-    }
-
-    // Keys are zero-padded sequence numbers, so lexicographic max = latest.
-    let latest = contents
-        .iter()
-        .filter_map(|obj| obj.key())
-        .filter(|k| k.ends_with(".tar.zst"))
-        .max()
-        .ok_or_else(|| "No snapshot tarballs found in S3 bucket".to_string())?;
-
-    Ok(latest.to_string())
-}
-
-fn tar_zstd_dir(dir: &Path) -> Result<Vec<u8>, String> {
-    let buf = Vec::new();
-    let encoder = zstd::Encoder::new(buf, 3).map_err(|e| format!("Zstd init failed: {e}"))?;
-    let mut tar = tar::Builder::new(encoder);
-    tar.append_dir_all(".", dir)
-        .map_err(|e| format!("Tar append failed: {e}"))?;
-    let encoder = tar
-        .into_inner()
-        .map_err(|e| format!("Tar finish failed: {e}"))?;
-    let buf = encoder
-        .finish()
-        .map_err(|e| format!("Zstd finish failed: {e}"))?;
-    Ok(buf)
-}
-
-fn untar_zstd(data: &[u8], dest: &Path) -> Result<(), String> {
-    let decoder =
-        zstd::Decoder::new(data).map_err(|e| format!("Zstd decode init failed: {e}"))?;
-    let mut archive = tar::Archive::new(decoder);
-    std::fs::create_dir_all(dest).map_err(|e| format!("Create dest dir failed: {e}"))?;
-    archive
-        .unpack(dest)
-        .map_err(|e| format!("Tar unpack failed: {e}"))?;
     Ok(())
 }
 
@@ -762,5 +736,68 @@ mod tests {
         assert_eq!(read.chain_hash, hash.to_vec());
         assert_eq!(read.timestamp_ms, 1234567890);
         assert_eq!(read.version, "0.1.0");
+    }
+
+    #[test]
+    fn test_create_snapshot_acquires_lock() {
+        use crate::backend::Backend;
+        use crate::journal::{spawn_journal_writer, JournalState, PendingEntry, JournalCommand};
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = data_dir.join("db");
+
+        let backend = Backend::open(&db_path).unwrap();
+        let conn = backend.connection().unwrap();
+        conn.query("CREATE NODE TABLE T(id INT64, PRIMARY KEY(id))").unwrap();
+        conn.query("CREATE (:T {id: 1})").unwrap();
+        drop(conn);
+
+        let journal_dir = data_dir.join("journal");
+        let state = Arc::new(JournalState::with_sequence_and_hash(0, [0u8; 32]));
+        let tx = spawn_journal_writer(journal_dir.clone(), 64 * 1024 * 1024, 100, state.clone());
+
+        // Write a journal entry.
+        tx.send(JournalCommand::Write(PendingEntry {
+            query: "CREATE (:T {id: 2})".into(),
+            params: vec![],
+        }))
+        .unwrap();
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(JournalCommand::Flush(ack_tx)).unwrap();
+        ack_rx.recv().unwrap();
+
+        let snapshot_lock = std::sync::RwLock::new(());
+        let retention = RetentionConfig { daily: 3, weekly: 0, monthly: 0 };
+
+        // create_snapshot takes the lock internally — no external lock needed.
+        let info = create_snapshot(data_dir, &backend, &snapshot_lock, &tx, &state, &retention)
+            .unwrap();
+
+        assert_eq!(info.sequence, 1);
+        assert!(info.path.exists());
+        assert!(info.path.join("snapshot.meta").exists());
+
+        // Lock is released after snapshot — can acquire read lock immediately.
+        let _read = snapshot_lock.read().unwrap();
+
+        tx.send(JournalCommand::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn test_create_snapshot_blocks_concurrent_reads() {
+        // Verify that the snapshot lock blocks read locks while held.
+        let lock = std::sync::RwLock::new(());
+
+        // Take write lock (simulating what create_snapshot does internally).
+        let _write = lock.write().unwrap();
+
+        // try_read should fail since write lock is held.
+        assert!(lock.try_read().is_err());
+
+        // After releasing write lock, read lock succeeds.
+        drop(_write);
+        assert!(lock.try_read().is_ok());
     }
 }

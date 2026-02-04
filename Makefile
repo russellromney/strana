@@ -1,4 +1,4 @@
-.PHONY: setup-lbug test build clean help e2e e2e-py e2e-python e2e-js e2e-go e2e-rust e2e-all bench up down logs status version-compat
+.PHONY: setup-lbug test build clean help e2e e2e-py e2e-python e2e-js e2e-go e2e-rust e2e-replica e2e-replica-focused e2e-all bench up down logs status version-compat
 
 LBUG_VERSION := v0.14.1
 LBUG_ARCHIVE := liblbug-osx-universal.tar.gz
@@ -56,6 +56,21 @@ e2e-rust: build ## Run end-to-end tests via neo4j Rust driver
 	GRAPHD_BINARY=$(CURDIR)/target/debug/graphd \
 	STRANA_ROOT=$(CURDIR) \
 	cargo run --bin test_rust
+
+e2e-replica: build ## Run replica mode end-to-end tests
+	cd tests/e2e && pip install -q -r requirements.txt && \
+	DYLD_LIBRARY_PATH=$(CURDIR)/lbug-lib \
+	GRAPHD_BINARY=$(CURDIR)/target/debug/graphd \
+	STRANA_ROOT=$(CURDIR) \
+	python3 test_replica.py -v
+
+e2e-replica-focused: build ## Run focused replica tests (speed, convergence, integrity)
+	cd tests/e2e && pip install -q -r requirements.txt && \
+	PYTHONUNBUFFERED=1 \
+	DYLD_LIBRARY_PATH=$(CURDIR)/lbug-lib \
+	GRAPHD_BINARY=$(CURDIR)/target/debug/graphd \
+	STRANA_ROOT=$(CURDIR) \
+	python3 test_replica_focused.py -v
 
 e2e-all: build ## Run all driver compatibility tests (Python, JavaScript, Go, Rust)
 	@echo "Running Python driver tests (integration)..."

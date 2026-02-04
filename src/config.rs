@@ -101,4 +101,20 @@ pub struct Config {
     /// S3 key prefix for snapshots (e.g. backups/mydb/).
     #[arg(long, env = "GRAPHD_S3_PREFIX", default_value = "")]
     pub s3_prefix: String,
+
+    /// Enable read-only replica mode.
+    #[arg(long)]
+    pub replica: bool,
+
+    /// Replica source (S3 bucket or local path). Format: s3://bucket/prefix or file:///path
+    #[arg(long, env = "GRAPHD_REPLICA_SOURCE", requires = "replica")]
+    pub replica_source: Option<String>,
+
+    /// Replica polling interval (e.g. "5s", "30s", "1m").
+    #[arg(long, env = "GRAPHD_REPLICA_POLL_INTERVAL", default_value = "10s")]
+    pub replica_poll_interval: String,
+
+    /// Warn if replica lag exceeds this duration (e.g. "60s", "5m").
+    #[arg(long, env = "GRAPHD_REPLICA_LAG_WARN", default_value = "60s")]
+    pub replica_lag_warn: String,
 }

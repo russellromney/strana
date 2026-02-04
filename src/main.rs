@@ -3,7 +3,8 @@ use axum::Router;
 use clap::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
+use std::time::Duration;
+use tracing::{info, warn};
 
 mod auth;
 mod backend;
@@ -13,6 +14,8 @@ mod engine;
 mod engine_manager;
 mod graphj;
 mod journal;
+mod journal_s3;
+mod replica;
 mod neo4j_http;
 mod query;
 mod rewriter;
@@ -28,6 +31,7 @@ use config::Config;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "graphd=info".into()),
@@ -100,16 +104,14 @@ async fn main() {
         if let (Some(ref bucket), None) = (&config.s3_bucket, &config.snapshot) {
             let snapshots_dir = config.data_dir.join("snapshots");
             info!("Downloading latest snapshot from S3...");
-            let key = snapshot::find_latest_snapshot_s3(bucket, &config.s3_prefix)
+            let snap_ref = snapshot::find_latest_snapshot_s3(bucket, &config.s3_prefix)
                 .await
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to find S3 snapshot: {e}");
                     std::process::exit(1);
                 });
-            let stem = key.trim_end_matches(".tar.zst");
-            let seq_str = stem.rsplit('/').next().unwrap_or(stem);
-            let snap_dir = snapshots_dir.join(seq_str);
-            snapshot::download_snapshot_s3(bucket, &key, &snap_dir)
+            let snap_dir = snapshots_dir.join(format!("{:016}", snap_ref.sequence));
+            snapshot::download_snapshot_s3_chunked(bucket, &snap_ref.prefix, &snap_dir)
                 .await
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to download S3 snapshot: {e}");
@@ -129,23 +131,67 @@ async fn main() {
         }
     }
 
+    // Handle replica mode: initial sync before opening database
+    let replica_config = if config.replica {
+        let replica_source = config.replica_source.as_ref().unwrap_or_else(|| {
+            eprintln!("Error: --replica-source required when --replica is enabled");
+            std::process::exit(1);
+        });
+
+        let poll_interval = replica::parse_duration(&config.replica_poll_interval)
+            .unwrap_or_else(|e| {
+                eprintln!("Error parsing replica-poll-interval: {e}");
+                std::process::exit(1);
+            });
+
+        let lag_warn = replica::parse_duration(&config.replica_lag_warn).unwrap_or_else(|e| {
+            eprintln!("Error parsing replica-lag-warn: {e}");
+            std::process::exit(1);
+        });
+
+        let replica_config = replica::ReplicaConfig {
+            source: replica_source.clone(),
+            data_dir: config.data_dir.clone(),
+            poll_interval,
+            lag_warn,
+            encryption_key,
+        };
+
+        info!("Replica mode enabled, starting initial sync...");
+        replica::initial_sync(&replica_config)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Replica initial sync failed: {e}");
+                std::process::exit(1);
+            });
+        info!("Replica initial sync complete");
+
+        // Store config to spawn poller after Engine creation
+        Some(replica_config)
+    } else {
+        None
+    };
+
     let db_dir = config.data_dir.join("db");
+    let t0 = std::time::Instant::now();
     let db = Backend::open(&db_dir).expect("Failed to open database");
-    info!("Opened database at {:?}", db_dir);
+    info!("[timing] main: Backend::open: {:?}", t0.elapsed());
 
     // Conditionally start journal writer.
+    let journal_dir = config.data_dir.join("journal");
     let (journal_tx, journal_state) = if config.journal {
-        let journal_dir = config.data_dir.join("journal");
+        let t0 = std::time::Instant::now();
         let (seq, hash) = journal::recover_journal_state(&journal_dir).unwrap_or_else(|e| {
             eprintln!("Failed to recover journal state: {e}");
             std::process::exit(1);
         });
+        info!("[timing] main: journal recovery: {:?}", t0.elapsed());
         if seq > 0 {
             info!("Journal: recovered state seq={seq}, hash={:x?}", &hash[..4]);
         }
         let state = Arc::new(journal::JournalState::with_sequence_and_hash(seq, hash));
         let tx = journal::spawn_journal_writer(
-            journal_dir,
+            journal_dir.clone(),
             config.journal_segment_mb * 1024 * 1024,
             config.journal_fsync_ms,
             state.clone(),
@@ -163,12 +209,34 @@ async fn main() {
     let db = Arc::new(db);
 
     // ── Engine ──
+    let t0 = std::time::Instant::now();
     let engine = Arc::new(engine::Engine::new(
         db.clone(),
         config.read_connections,
         journal_tx.clone(),
     ));
-    info!("Engine: {} reader(s) + 1 writer", config.read_connections);
+    info!(
+        "[timing] main: Engine::new: {:?} ({} readers)",
+        t0.elapsed(),
+        config.read_connections
+    );
+
+    // ── Replica catch-up and poller (after Engine creation) ──
+    if let Some(replica_cfg) = replica_config {
+        // Run one poll cycle to catch up before starting Bolt server
+        // This ensures replica is current when it starts serving queries
+        let t0 = std::time::Instant::now();
+        replica::catchup_poll(&replica_cfg, &engine)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Replica catch-up poll failed: {}", e);
+            });
+        info!("[timing] main: catchup_poll: {:?}", t0.elapsed());
+
+        // Start background poller for continuous updates
+        let _poller_handle = replica::spawn_poller(replica_cfg, engine.clone());
+        info!("Replica poller started");
+    }
 
     // ── Bolt listener ──
     let bolt_state = bolt::BoltState {
@@ -177,6 +245,7 @@ async fn main() {
         conn_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.bolt_max_connections as usize,
         )),
+        replica: config.replica,
     };
 
     // ── Shutdown signal ──
@@ -186,6 +255,21 @@ async fn main() {
         info!("Shutdown signal received");
         shutdown_tx.send(true).ok();
     });
+
+    // ── Journal S3 uploader (primary only, when journal + S3 configured) ──
+    if let (Some(ref jtx), Some(ref bucket)) = (&journal_tx, &config.s3_bucket) {
+        if !config.replica {
+            journal_s3::spawn_journal_uploader(
+                jtx.clone(),
+                journal_dir.clone(),
+                bucket.clone(),
+                config.s3_prefix.clone(),
+                Duration::from_secs(1),
+                shutdown_rx.clone(),
+            );
+            info!("Journal S3 uploader: enabled (interval=1s)");
+        }
+    }
 
     let bolt_addr = format!("{}:{}", config.bolt_host, config.bolt_port);
     let bolt_state_clone = bolt_state.clone();

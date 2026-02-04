@@ -13,7 +13,7 @@ use crate::engine::Engine;
 use crate::journal::{self, JournalCommand, PendingEntry};
 use crate::query::{self, ExecutedQuery};
 use crate::snapshot::RetentionConfig;
-use crate::values::GraphValue;
+use crate::values::{json_to_param_values, GraphValue};
 
 /// Shared application state.
 #[derive(Clone)]
@@ -385,8 +385,7 @@ pub async fn snapshot_handler(
     let s3_prefix = state.s3_prefix.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let _lock = lock.write().unwrap_or_else(|e| e.into_inner());
-        crate::snapshot::create_snapshot(&data_dir, &db, &journal, &journal_state, &retention)
+        crate::snapshot::create_snapshot(&data_dir, &db, &lock, &journal, &journal_state, &retention)
     })
     .await
     .unwrap();
@@ -394,7 +393,7 @@ pub async fn snapshot_handler(
     match result {
         Ok(info) => {
             if let Some(ref bucket) = s3_bucket {
-                if let Err(e) = crate::snapshot::upload_snapshot_s3(
+                if let Err(e) = crate::snapshot::upload_snapshot_s3_chunked(
                     &info.path,
                     bucket,
                     &s3_prefix,
@@ -465,7 +464,7 @@ fn tx_worker(
                     if journal::is_mutation(&eq.rewritten_query) {
                         journal_buf.push(PendingEntry {
                             query: eq.rewritten_query.clone(),
-                            params: eq.merged_params.clone(),
+                            params: json_to_param_values(&eq.merged_params),
                         });
                     }
                 }

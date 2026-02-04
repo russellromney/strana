@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/graphd-engine"]
+
 [package]
 name = "graphd"
 version = "0.1.0"
@@ -17,6 +20,7 @@ name = "graphd"
 path = "src/main.rs"
 
 [dependencies]
+graphd-engine = { path = "crates/graphd-engine", features = ["bolt"] }
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 lbug = { version = "0.14", default-features = false }
@@ -61,3 +65,6 @@ harness = false
 [[bench]]
 name = "throughput_bench"
 harness = false
+
+[patch.crates-io]
+lbug = { path = "../ladybug-fork/tools/rust_api" }

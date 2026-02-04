@@ -10,19 +10,20 @@ use crate::auth::TokenStore;
 use crate::engine::Engine;
 use crate::journal::{self, JournalCommand, JournalSender, PendingEntry};
 use crate::query;
-use crate::values::{self, GraphValue};
+use crate::values::{self, json_to_param_values, GraphValue};
 
+use bolt_proto::message::Record;
 use bolt_proto::{Message, Value};
-use bolt_proto::message::{Record, Success, Failure};
 use std::collections::HashMap;
 
-/// Bolt protocol version negotiated with the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoltVersion {
-    V4_4,
-    /// Bolt 5.x where the u8 is the minor version (0-7 for Bolt 5.0-5.7)
-    V5(u8),
-}
+// Shared Bolt protocol types and helpers from graphd-engine.
+use graphd_engine::bolt::{
+    bolt_params_to_json, extract_credentials, success_message, version_bytes, BOLT_MAGIC,
+};
+pub use graphd_engine::bolt::{
+    add_connection_hints, failure_message_versioned, negotiate_bolt_version,
+    negotiate_bolt_version_with_limit, BoltVersion,
+};
 
 /// Shared state for the Bolt listener.
 #[derive(Clone)]
@@ -30,6 +31,7 @@ pub struct BoltState {
     pub engine: Arc<Engine>,
     pub tokens: Arc<TokenStore>,
     pub conn_semaphore: Arc<tokio::sync::Semaphore>,
+    pub replica: bool,
 }
 
 /// Start the Bolt TCP listener.
@@ -90,7 +92,7 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
         .read_exact(&mut magic)
         .await
         .map_err(|e| format!("read magic: {e}"))?;
-    if magic != [0x60, 0x60, 0xB0, 0x17] {
+    if magic != BOLT_MAGIC {
         return Err("Invalid Bolt magic bytes".into());
     }
 
@@ -118,26 +120,19 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
     };
 
     // Send negotiated version back to client
-    let version_bytes = match bolt_version {
-        BoltVersion::V4_4 => [0x00, 0x00, 0x04, 0x04],
-        BoltVersion::V5(minor) => [0x00, 0x00, minor, 0x05],
-    };
     stream
-        .write_all(&version_bytes)
+        .write_all(&version_bytes(bolt_version))
         .await
         .map_err(|e| format!("write version: {e}"))?;
     stream.flush().await.map_err(|e| format!("flush: {e}"))?;
 
-    let version_str = match bolt_version {
-        BoltVersion::V4_4 => "4.4".to_string(),
-        BoltVersion::V5(minor) => format!("5.{}", minor),
-    };
-    info!("Negotiated Bolt version: {}", version_str);
+    info!("Negotiated Bolt version: {}", bolt_version);
 
     // ── Spawn blocking session worker ──
     // The Bolt session owns a database connection and runs queries on it.
     let engine = state.engine.clone();
     let tokens = state.tokens.clone();
+    let replica = state.replica;
 
     // Channel for sending requests from the async reader to the blocking worker.
     let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<BoltOp>();
@@ -145,7 +140,7 @@ async fn handle_connection(socket: TcpStream, state: BoltState) -> Result<(), St
 
     // Blocking session worker.
     let worker_handle = tokio::task::spawn_blocking(move || {
-        bolt_session_worker(bolt_version, engine, tokens, req_rx, resp_tx);
+        bolt_session_worker(bolt_version, engine, tokens, replica, req_rx, resp_tx);
     });
 
     // ── Message loop ──
@@ -208,6 +203,7 @@ fn bolt_session_worker(
     bolt_version: BoltVersion,
     engine: Arc<Engine>,
     tokens: Arc<TokenStore>,
+    replica: bool,
     rx: tokio::sync::mpsc::UnboundedReceiver<BoltOp>,
     tx: tokio::sync::mpsc::UnboundedSender<Vec<Bytes>>,
 ) {
@@ -261,6 +257,7 @@ fn bolt_session_worker(
             &tokens,
             &journal,
             &snapshot_lock,
+            replica,
             &mut authenticated,
             &mut in_transaction,
             &mut tx_journal_buf,
@@ -323,6 +320,7 @@ fn handle_bolt_message<'db>(
     tokens: &Arc<TokenStore>,
     journal: &Option<JournalSender>,
     snapshot_lock: &Arc<RwLock<()>>,
+    replica: bool,
     authenticated: &mut bool,
     in_transaction: &mut bool,
     tx_journal_buf: &mut Vec<PendingEntry>,
@@ -383,13 +381,23 @@ fn handle_bolt_message<'db>(
         // ── RUN ──
         Message::Run(run) => {
             if !*authenticated {
-                return failure_message(
+                return failure_message_versioned(
+                    bolt_version,
                     "Neo.ClientError.Security.AuthenticationRateLimit",
                     "Not authenticated",
                 );
             }
 
             let query_str = run.query();
+
+            // Reject mutations in replica mode.
+            if replica && journal::is_mutation(query_str) {
+                return failure_message_versioned(
+                    bolt_version,
+                    "Neo.ClientError.Database.ReadOnlyMode",
+                    "Cannot execute write operations on a read-only replica",
+                );
+            }
 
             // Convert Bolt parameters to JSON for our query engine.
             let json_params = bolt_params_to_json(run.parameters());
@@ -408,7 +416,7 @@ fn handle_bolt_message<'db>(
                         if journal::is_mutation(&raw.rewritten_query) {
                             tx_journal_buf.push(PendingEntry {
                                 query: raw.rewritten_query.clone(),
-                                params: raw.merged_params.clone(),
+                                params: json_to_param_values(&raw.merged_params),
                             });
                         }
                     } else {
@@ -425,7 +433,7 @@ fn handle_bolt_message<'db>(
                     success_message(metadata)
                 }
                 Err(e) => {
-                    failure_message(
+                    failure_message_versioned(bolt_version,
                         "Neo.DatabaseError.General.UnknownError",
                         &format!("Query error: {e}"),
                     )
@@ -436,13 +444,21 @@ fn handle_bolt_message<'db>(
         // ── RUN_WITH_METADATA ──
         Message::RunWithMetadata(run) => {
             if !*authenticated {
-                return failure_message(
+                return failure_message_versioned(bolt_version,
                     "Neo.ClientError.Security.AuthenticationRateLimit",
                     "Not authenticated",
                 );
             }
 
             let query_str = run.statement();
+
+            // Reject mutations in replica mode.
+            if replica && journal::is_mutation(query_str) {
+                return failure_message_versioned(bolt_version,
+                    "Neo.ClientError.Database.ReadOnlyMode",
+                    "Cannot execute write operations on a read-only replica",
+                );
+            }
 
             // Convert Bolt parameters to JSON for our query engine.
             let json_params = bolt_params_to_json(run.parameters());
@@ -461,7 +477,7 @@ fn handle_bolt_message<'db>(
                         if journal::is_mutation(&raw.rewritten_query) {
                             tx_journal_buf.push(PendingEntry {
                                 query: raw.rewritten_query.clone(),
-                                params: raw.merged_params.clone(),
+                                params: json_to_param_values(&raw.merged_params),
                             });
                         }
                     } else {
@@ -478,7 +494,7 @@ fn handle_bolt_message<'db>(
                     success_message(metadata)
                 }
                 Err(e) => {
-                    failure_message(
+                    failure_message_versioned(bolt_version,
                         "Neo.DatabaseError.General.UnknownError",
                         &format!("Query error: {e}"),
                     )
@@ -543,15 +559,26 @@ fn handle_bolt_message<'db>(
         // ── BEGIN ──
         Message::Begin(_) => {
             if !*authenticated {
-                return failure_message(
+                return failure_message_versioned(
+                    bolt_version,
                     "Neo.ClientError.Security.AuthenticationRateLimit",
                     "Not authenticated",
                 );
             }
             if *in_transaction {
-                return failure_message(
+                return failure_message_versioned(
+                    bolt_version,
                     "Neo.ClientError.Transaction.TransactionNotFound",
                     "Transaction already active",
+                );
+            }
+
+            // Reject transactions in replica mode (can't predict if they'll contain mutations).
+            if replica {
+                return failure_message_versioned(
+                    bolt_version,
+                    "Neo.ClientError.Database.ReadOnlyMode",
+                    "Cannot begin transactions on a read-only replica",
                 );
             }
 
@@ -560,7 +587,8 @@ fn handle_bolt_message<'db>(
                     *in_transaction = true;
                     success_message(HashMap::new())
                 }
-                Err(e) => failure_message(
+                Err(e) => failure_message_versioned(
+                    bolt_version,
                     "Neo.DatabaseError.General.UnknownError",
                     &format!("BEGIN failed: {e}"),
                 ),
@@ -570,7 +598,7 @@ fn handle_bolt_message<'db>(
         // ── COMMIT ──
         Message::Commit => {
             if !*in_transaction {
-                return failure_message(
+                return failure_message_versioned(bolt_version,
                     "Neo.ClientError.Transaction.TransactionNotFound",
                     "No active transaction",
                 );
@@ -589,7 +617,7 @@ fn handle_bolt_message<'db>(
                     }
                     success_message(HashMap::new())
                 }
-                Err(e) => failure_message(
+                Err(e) => failure_message_versioned(bolt_version,
                     "Neo.DatabaseError.General.UnknownError",
                     &format!("COMMIT failed: {e}"),
                 ),
@@ -599,7 +627,7 @@ fn handle_bolt_message<'db>(
         // ── ROLLBACK ──
         Message::Rollback => {
             if !*in_transaction {
-                return failure_message(
+                return failure_message_versioned(bolt_version,
                     "Neo.ClientError.Transaction.TransactionNotFound",
                     "No active transaction",
                 );
@@ -611,7 +639,7 @@ fn handle_bolt_message<'db>(
                     tx_journal_buf.clear();
                     success_message(HashMap::new())
                 }
-                Err(e) => failure_message(
+                Err(e) => failure_message_versioned(bolt_version,
                     "Neo.DatabaseError.General.UnknownError",
                     &format!("ROLLBACK failed: {e}"),
                 ),
@@ -700,7 +728,7 @@ fn handle_bolt_message<'db>(
         // Catch-all for unsupported messages
         _ => {
             warn!("Unsupported Bolt message: {:?}", req);
-            failure_message(
+            failure_message_versioned(bolt_version,
                 "Neo.ClientError.Request.Invalid",
                 "Unsupported message type",
             )
@@ -709,123 +737,16 @@ fn handle_bolt_message<'db>(
     }
 }
 
-// ─── Response helpers ───
-
-/// Create a SUCCESS response message as chunked bytes.
-fn success_message(metadata: HashMap<String, Value>) -> Vec<Bytes> {
-    let success = Success::new(metadata);
-    let msg = Message::Success(success);
-    msg.into_chunks().unwrap_or_else(|e| {
-        error!("Failed to serialize SUCCESS: {e}");
-        Vec::new()
-    })
-}
-
-/// Create a FAILURE response message as chunked bytes (legacy, pre-5.7).
-fn failure_message(code: &str, message: &str) -> Vec<Bytes> {
-    failure_message_versioned(BoltVersion::V4_4, code, message)
-}
-
-/// Create a version-aware FAILURE response message as chunked bytes.
-///
-/// **Bolt 4.4-5.6:**
-/// - Returns `code` (Neo4j error code) and `message` fields
-///
-/// **Bolt 5.7+:**
-/// - Returns `neo4j_code` (replaces `code`)
-/// - Returns `gql_status` (GQL standard status identifier)
-/// - Returns `description` (human-readable description)
-/// - Can include `diagnostic_record` for additional context
-#[cfg_attr(test, allow(dead_code))]
-pub fn failure_message_versioned(bolt_version: BoltVersion, code: &str, message: &str) -> Vec<Bytes> {
-    let mut metadata = HashMap::new();
-
-    match bolt_version {
-        BoltVersion::V5(minor) if minor >= 7 => {
-            // Bolt 5.7+: GQL-compliant error reporting
-            metadata.insert("neo4j_code".to_string(), Value::from(code));
-            metadata.insert("description".to_string(), Value::from(message));
-
-            // Map Neo4j error codes to GQL status codes
-            // For now, use a simplified mapping - full mapping would be extensive
-            let gql_status = map_neo4j_to_gql_status(code);
-            metadata.insert("gql_status".to_string(), Value::from(gql_status));
-
-            // Diagnostic record could include additional context
-            // For now, keep it minimal
-            let mut diagnostic = HashMap::new();
-            diagnostic.insert("_severity".to_string(), Value::from("ERROR"));
-            metadata.insert("diagnostic_record".to_string(), Value::from(diagnostic));
-        }
-        _ => {
-            // Bolt 4.4-5.6: Legacy error reporting
-            metadata.insert("code".to_string(), Value::from(code));
-            metadata.insert("message".to_string(), Value::from(message));
-        }
-    }
-
-    let failure = Failure::new(metadata);
-    let msg = Message::Failure(failure);
-    msg.into_chunks().unwrap_or_else(|e| {
-        error!("Failed to serialize FAILURE: {e}");
-        Vec::new()
-    })
-}
-
-/// Map Neo4j error codes to GQL status codes (simplified).
-///
-/// Full mapping: https://neo4j.com/docs/status-codes/current/
-fn map_neo4j_to_gql_status(neo4j_code: &str) -> &'static str {
-    match neo4j_code {
-        code if code.starts_with("Neo.ClientError.Security") => "42000", // Syntax error or access rule violation
-        code if code.starts_with("Neo.ClientError.Statement") => "42000", // Syntax error or access rule violation
-        code if code.starts_with("Neo.ClientError.Schema") => "42000", // Syntax error or access rule violation
-        code if code.starts_with("Neo.ClientError.Request") => "42000", // Syntax error or access rule violation
-        code if code.starts_with("Neo.ClientError") => "22000", // Data exception
-        code if code.starts_with("Neo.TransientError") => "40000", // Transaction rollback
-        code if code.starts_with("Neo.DatabaseError") => "HZ000", // Remote database access
-        _ => "HZ000", // General error - Remote database access
-    }
-}
-
-// ─── Value conversion ───
-
-/// Convert Bolt parameters (HashMap<String, Value>) to JSON for the shared query engine.
-fn bolt_params_to_json(params: &HashMap<String, Value>) -> Option<serde_json::Value> {
-    if params.is_empty() {
-        return None;
-    }
-    let mut map = serde_json::Map::new();
-    for (k, v) in params {
-        map.insert(k.clone(), bolt_value_to_json(v));
-    }
-    Some(serde_json::Value::Object(map))
-}
-
-/// Convert a bolt-rs Value to JSON.
-fn bolt_value_to_json(bolt: &Value) -> serde_json::Value {
-    match bolt {
-        Value::Boolean(b) => serde_json::Value::Bool(*b),
-        Value::Integer(i) => serde_json::json!(*i),
-        Value::Float(f) => serde_json::json!(*f),
-        Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Null => serde_json::Value::Null,
-        Value::List(list) => {
-            serde_json::Value::Array(list.iter().map(bolt_value_to_json).collect())
-        }
-        Value::Map(map) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in map {
-                obj.insert(k.clone(), bolt_value_to_json(v));
-            }
-            serde_json::Value::Object(obj)
-        }
-        _ => serde_json::Value::Null, // Bytes, DateTime, Node, Relationship, etc.
-    }
-}
+// ─── Value conversion (local: uses crate::values::GraphValue) ───
 
 /// Convert a GraphValue to bolt-rs Value for RECORD responses.
+///
+/// Kept local because it uses strana's `crate::values::GraphValue` type.
+/// The shared `graphd_engine::bolt::graph_value_to_bolt` uses graphd-engine's
+/// own GraphValue type (structurally identical but a different Rust type).
 fn graph_value_to_bolt(gv: &GraphValue) -> Value {
+    use graphd_engine::bolt::json_to_bolt;
+
     match gv {
         GraphValue::Null => Value::Null,
         GraphValue::Bool(b) => Value::from(*b),
@@ -850,74 +771,7 @@ fn graph_value_to_bolt(gv: &GraphValue) -> Value {
     }
 }
 
-/// Convert serde_json::Value to bolt-rs Value (for tagged value serialization).
-fn json_to_bolt(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::from(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::from(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::from(f)
-            } else {
-                Value::Null
-            }
-        }
-        serde_json::Value::String(s) => Value::from(s.clone()),
-        serde_json::Value::Array(arr) => {
-            Value::from(arr.iter().map(json_to_bolt).collect::<Vec<_>>())
-        }
-        serde_json::Value::Object(obj) => {
-            let map: HashMap<String, Value> = obj
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_bolt(v)))
-                .collect();
-            Value::from(map)
-        }
-    }
-}
-
-// ─── Bolt auth ───
-
-/// Extract the "credentials" string from a HELLO/LOGON metadata map.
-fn extract_credentials(metadata: &HashMap<String, Value>) -> Option<&str> {
-    metadata.get("credentials").and_then(|v| match v {
-        Value::String(s) => Some(s.as_str()),
-        _ => None,
-    })
-}
-
-// ─── Bolt connection hints ───
-
-/// Add version-specific connection hints to HELLO/LOGON SUCCESS metadata.
-///
-/// Connection hints inform the client about server capabilities and are introduced
-/// in specific Bolt protocol versions.
-#[cfg_attr(test, allow(dead_code))]
-pub fn add_connection_hints(bolt_version: BoltVersion, metadata: &mut HashMap<String, Value>) {
-    // Hints map (nested dictionary)
-    let mut hints = HashMap::new();
-
-    match bolt_version {
-        BoltVersion::V4_4 => {
-            // No connection hints in Bolt 4.4
-        }
-        BoltVersion::V5(minor) => {
-            // Bolt 5.4+: telemetry.enabled hint
-            if minor >= 4 {
-                hints.insert("telemetry.enabled".to_string(), Value::from(true));
-            }
-
-            // Add the hints map to metadata if not empty
-            if !hints.is_empty() {
-                metadata.insert("hints".to_string(), Value::from(hints));
-            }
-        }
-    }
-}
-
-// ─── Bolt version negotiation ───
+// ─── Env-based version limit (strana-specific testing feature) ───
 
 /// Get maximum Bolt version from environment (for version compatibility testing).
 ///
@@ -938,10 +792,6 @@ pub fn add_connection_hints(bolt_version: BoltVersion, metadata: &mut HashMap<St
 /// BOLT_MAX_VERSION=4.4 make e2e-py
 /// make version-compat  # Test all versions automatically
 /// ```
-///
-/// This is particularly useful for verifying compatibility with clients that
-/// only support older Bolt versions, or for testing version-specific protocol
-/// features without needing multiple client implementations.
 fn get_max_bolt_version_from_env() -> Option<BoltVersion> {
     std::env::var("BOLT_MAX_VERSION").ok().and_then(|s| {
         let parts: Vec<&str> = s.split('.').collect();
@@ -962,471 +812,4 @@ fn get_max_bolt_version_from_env() -> Option<BoltVersion> {
             }
         }
     })
-}
-
-/// Negotiate Bolt protocol version with the client, with optional version limit.
-///
-/// Each proposal is 4 bytes: [patch, range, minor, major].
-/// `range` means the client accepts major.minor down to major.(minor - range).
-/// Prefers the highest supported version up to the limit.
-///
-/// Supports Bolt 4.4 and Bolt 5.0-5.7.
-///
-/// The `max_version` parameter allows artificially limiting negotiation for testing.
-/// See `get_max_bolt_version_from_env()` for details on the BOLT_MAX_VERSION feature.
-#[cfg_attr(test, allow(dead_code))]
-pub fn negotiate_bolt_version_with_limit(
-    versions: &[u8; 16],
-    max_version: Option<BoltVersion>,
-) -> Option<BoltVersion> {
-    const MAX_BOLT_5_MINOR: u8 = 7;
-
-    // Determine effective max version
-    let (max_5_minor, allow_5_x, allow_4_4) = match max_version {
-        Some(BoltVersion::V4_4) => (0, false, true), // Only allow 4.4
-        Some(BoltVersion::V5(m)) => (m, true, true), // Allow 5.0-5.m and 4.4
-        None => (MAX_BOLT_5_MINOR, true, true),       // Allow all versions
-    };
-
-    // Try to negotiate highest version first (5.7 > ... > 5.0 > 4.4)
-    for i in 0..4 {
-        let offset = i * 4;
-        let major = versions[offset + 3];
-        let minor = versions[offset + 2];
-        let range = versions[offset + 1];
-
-        // Check for Bolt 5.x (client accepts versions in range)
-        if allow_5_x && major == 5 {
-            let min_minor = minor.saturating_sub(range);
-            let max_minor = minor;
-
-            // Find the highest version we support that the client accepts (up to limit)
-            for supported_minor in (0..=max_5_minor.min(MAX_BOLT_5_MINOR)).rev() {
-                if supported_minor >= min_minor && supported_minor <= max_minor {
-                    return Some(BoltVersion::V5(supported_minor));
-                }
-            }
-        }
-
-        // Check for Bolt 4.4 (client accepts versions including 4.4)
-        if allow_4_4 && major == 4 && minor >= 4 && minor.saturating_sub(range) <= 4 {
-            return Some(BoltVersion::V4_4);
-        }
-    }
-
-    None
-}
-
-/// Negotiate Bolt protocol version with the client.
-///
-/// Public version without limit, used by tests and as a convenience wrapper.
-#[cfg_attr(test, allow(dead_code))]
-pub fn negotiate_bolt_version(versions: &[u8; 16]) -> Option<BoltVersion> {
-    negotiate_bolt_version_with_limit(versions, None)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ─── bolt_value_to_json ───
-
-    #[test]
-    fn bolt_string_to_json() {
-        let bolt = Value::from("hello");
-        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!("hello"));
-    }
-
-    #[test]
-    fn bolt_integer_to_json() {
-        let bolt = Value::from(42i64);
-        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!(42));
-    }
-
-    #[test]
-    fn bolt_float_to_json() {
-        let bolt = Value::from(3.14f64);
-        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!(3.14));
-    }
-
-    #[test]
-    fn bolt_bool_to_json() {
-        let bolt = Value::from(true);
-        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!(true));
-    }
-
-    #[test]
-    fn bolt_null_to_json() {
-        let bolt = Value::Null;
-        assert_eq!(bolt_value_to_json(&bolt), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn bolt_list_to_json() {
-        let bolt = Value::from(vec![Value::from(1i64), Value::from("two")]);
-        assert_eq!(bolt_value_to_json(&bolt), serde_json::json!([1, "two"]));
-    }
-
-    #[test]
-    fn bolt_map_to_json() {
-        let mut map = HashMap::new();
-        map.insert("name".to_string(), Value::from("Alice"));
-        map.insert("age".to_string(), Value::from(30i64));
-        let bolt = Value::from(map);
-        let json = bolt_value_to_json(&bolt);
-        assert_eq!(json["name"], "Alice");
-        assert_eq!(json["age"], 30);
-    }
-
-    // ─── bolt_params_to_json ───
-
-    #[test]
-    fn empty_params_returns_none() {
-        let params = HashMap::new();
-        assert!(bolt_params_to_json(&params).is_none());
-    }
-
-    #[test]
-    fn params_with_values() {
-        let mut params = HashMap::new();
-        params.insert("name".to_string(), Value::from("Bob"));
-        let json = bolt_params_to_json(&params).unwrap();
-        assert_eq!(json["name"], "Bob");
-    }
-
-    // ─── graph_value_to_bolt ───
-
-    #[test]
-    fn graph_null_to_bolt() {
-        let gv = GraphValue::Null;
-        assert_eq!(graph_value_to_bolt(&gv), Value::Null);
-    }
-
-    #[test]
-    fn graph_bool_to_bolt() {
-        let gv = GraphValue::Bool(true);
-        match graph_value_to_bolt(&gv) {
-            Value::Boolean(b) => assert!(b),
-            other => panic!("Expected Boolean, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn graph_int_to_bolt() {
-        let gv = GraphValue::Int(99);
-        match graph_value_to_bolt(&gv) {
-            Value::Integer(i) => assert_eq!(i, 99),
-            other => panic!("Expected Integer, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn graph_float_to_bolt() {
-        let gv = GraphValue::Float(2.718);
-        match graph_value_to_bolt(&gv) {
-            Value::Float(f) => assert!((f - 2.718).abs() < 1e-10),
-            other => panic!("Expected Float, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn graph_string_to_bolt() {
-        let gv = GraphValue::String("hello".into());
-        match graph_value_to_bolt(&gv) {
-            Value::String(s) => assert_eq!(s, "hello"),
-            other => panic!("Expected String, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn graph_list_to_bolt() {
-        let gv = GraphValue::List(vec![GraphValue::Int(1), GraphValue::Int(2)]);
-        match graph_value_to_bolt(&gv) {
-            Value::List(list) => {
-                assert_eq!(list.len(), 2);
-                match &list[0] {
-                    Value::Integer(i) => assert_eq!(*i, 1),
-                    other => panic!("Expected Integer, got {other:?}"),
-                }
-            }
-            other => panic!("Expected List, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn graph_map_to_bolt() {
-        let mut hm = std::collections::HashMap::new();
-        hm.insert("key".to_string(), GraphValue::String("value".into()));
-        let gv = GraphValue::Map(hm);
-        match graph_value_to_bolt(&gv) {
-            Value::Map(bmap) => {
-                let val = bmap.get("key").unwrap();
-                match val {
-                    Value::String(s) => assert_eq!(s, "value"),
-                    other => panic!("Expected String, got {other:?}"),
-                }
-            }
-            other => panic!("Expected Map, got {other:?}"),
-        }
-    }
-
-    // ─── json_to_bolt ───
-
-    #[test]
-    fn json_null_to_bolt() {
-        assert_eq!(json_to_bolt(&serde_json::Value::Null), Value::Null);
-    }
-
-    #[test]
-    fn json_string_to_bolt() {
-        match json_to_bolt(&serde_json::json!("test")) {
-            Value::String(s) => assert_eq!(s, "test"),
-            other => panic!("Expected String, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn json_integer_to_bolt() {
-        match json_to_bolt(&serde_json::json!(42)) {
-            Value::Integer(i) => assert_eq!(i, 42),
-            other => panic!("Expected Integer, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn json_float_to_bolt() {
-        match json_to_bolt(&serde_json::json!(3.14)) {
-            Value::Float(f) => assert!((f - 3.14).abs() < 1e-10),
-            other => panic!("Expected Float, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn json_array_to_bolt() {
-        match json_to_bolt(&serde_json::json!([1, "two"])) {
-            Value::List(list) => assert_eq!(list.len(), 2),
-            other => panic!("Expected List, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn json_object_to_bolt() {
-        match json_to_bolt(&serde_json::json!({"a": 1})) {
-            Value::Map(map) => {
-                assert_eq!(map.len(), 1);
-                let val = map.get("a").unwrap();
-                match val {
-                    Value::Integer(i) => assert_eq!(*i, 1),
-                    other => panic!("Expected Integer, got {other:?}"),
-                }
-            }
-            other => panic!("Expected Map, got {other:?}"),
-        }
-    }
-
-    // ─── Roundtrip: JSON → Bolt → JSON ───
-
-    #[test]
-    fn json_bolt_roundtrip_nested() {
-        let original = serde_json::json!({
-            "name": "Alice",
-            "age": 30,
-            "active": true,
-            "scores": [90, 85, 92],
-            "address": {
-                "city": "Wonderland",
-                "zip": null
-            }
-        });
-        let bolt = json_to_bolt(&original);
-        let back = bolt_value_to_json(&bolt);
-        assert_eq!(back["name"], "Alice");
-        assert_eq!(back["age"], 30);
-        assert_eq!(back["active"], true);
-        assert_eq!(back["scores"], serde_json::json!([90, 85, 92]));
-        assert_eq!(back["address"]["city"], "Wonderland");
-        assert!(back["address"]["zip"].is_null());
-    }
-
-    // ─── Roundtrip: GraphValue → Bolt → JSON ───
-
-    #[test]
-    fn graph_value_bolt_roundtrip() {
-        let gv = GraphValue::List(vec![
-            GraphValue::String("hello".into()),
-            GraphValue::Int(42),
-            GraphValue::Float(1.5),
-            GraphValue::Bool(false),
-            GraphValue::Null,
-        ]);
-        let bolt = graph_value_to_bolt(&gv);
-        let json = bolt_value_to_json(&bolt);
-        assert_eq!(json, serde_json::json!(["hello", 42, 1.5, false, null]));
-    }
-
-    // ─── extract_credentials ───
-
-    #[test]
-    fn extract_credentials_basic_scheme() {
-        let mut metadata = HashMap::new();
-        metadata.insert("scheme".to_string(), Value::from("basic"));
-        metadata.insert("principal".to_string(), Value::from("neo4j"));
-        metadata.insert("credentials".to_string(), Value::from("my-secret-token"));
-        assert_eq!(extract_credentials(&metadata), Some("my-secret-token"));
-    }
-
-    #[test]
-    fn extract_credentials_missing() {
-        let metadata = HashMap::new();
-        assert_eq!(extract_credentials(&metadata), None);
-    }
-
-    #[test]
-    fn extract_credentials_non_string() {
-        let mut metadata = HashMap::new();
-        metadata.insert("credentials".to_string(), Value::from(42i64));
-        assert_eq!(extract_credentials(&metadata), None);
-    }
-
-    #[test]
-    fn extract_credentials_empty_string() {
-        let mut metadata = HashMap::new();
-        metadata.insert("credentials".to_string(), Value::from(""));
-        assert_eq!(extract_credentials(&metadata), Some(""));
-    }
-
-    // ─── negotiate_bolt_version ───
-
-    #[test]
-    fn version_exact_4_4() {
-        // Client proposes exactly 4.4 in first slot.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V4_4));
-    }
-
-    #[test]
-    fn version_range_includes_4_4() {
-        // Client proposes 4.4 with range 2 → accepts 4.4, 4.3, 4.2.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x02, 0x04, 0x04]);
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V4_4));
-    }
-
-    #[test]
-    fn version_4_3_no_range() {
-        // Client proposes only 4.3 — no range includes 4.4.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x03, 0x04]); // 4.3
-        assert_eq!(negotiate_bolt_version(&v), None);
-    }
-
-    #[test]
-    fn version_5_0() {
-        // Client proposes 5.0.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(0)));
-    }
-
-    #[test]
-    fn version_5_1() {
-        // Client proposes 5.1.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0x05]); // 5.1
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(1)));
-    }
-
-    #[test]
-    fn version_prefers_highest() {
-        // Client proposes 5.1, 5.0, 4.4 — should prefer 5.1.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0x05]); // 5.1
-        v[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // 5.0
-        v[8..12].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(1)));
-    }
-
-    #[test]
-    fn version_in_second_slot() {
-        // First slot is unsupported version 6.0, second slot is 4.4.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x06]); // 6.0 (unsupported)
-        v[4..8].copy_from_slice(&[0x00, 0x00, 0x04, 0x04]); // 4.4
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V4_4));
-    }
-
-    #[test]
-    fn version_all_zeros() {
-        let v = [0u8; 16];
-        assert_eq!(negotiate_bolt_version(&v), None);
-    }
-
-    #[test]
-    fn version_high_minor_range_includes_4_4() {
-        // Client proposes 4.6 with range 3 → accepts 4.6, 4.5, 4.4, 4.3.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x03, 0x06, 0x04]);
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V4_4));
-    }
-
-    #[test]
-    fn version_5_1_with_range() {
-        // Client proposes 5.1 with range 1 → accepts 5.1 and 5.0.
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x01, 0x01, 0x05]);
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(1)));
-    }
-
-    #[test]
-    fn version_malformed_range_greater_than_minor() {
-        // Malformed: range > minor (5.1 with range 2 claims to accept down to 5.-1)
-        // With saturating_sub, treats as accepting down to 5.0, so matches 5.1
-        // This lenient behavior is acceptable for malformed input
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x02, 0x01, 0x05]); // 5.1 with range 2
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(1)));
-    }
-
-    #[test]
-    fn version_5_2_down_to_5_0_matches_5_2() {
-        // Client proposes 5.2 with range 2 → accepts 5.2, 5.1, 5.0
-        // Should match 5.2 (highest we support in that range, since we now support up to 5.7)
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x02, 0x02, 0x05]); // 5.2 with range 2
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(2)));
-    }
-
-    #[test]
-    fn version_5_2_no_range_matches_5_2() {
-        // Client proposes only 5.2 (no range) → we now support 5.2
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x02, 0x05]); // 5.2 no range
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(2)));
-    }
-
-    #[test]
-    fn version_5_7() {
-        // Client proposes 5.7 (latest supported).
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x07, 0x05]); // 5.7
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(7)));
-    }
-
-    #[test]
-    fn version_5_8_not_supported() {
-        // Client proposes 5.8 → we only support up to 5.7
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x00, 0x08, 0x05]); // 5.8
-        assert_eq!(negotiate_bolt_version(&v), None);
-    }
-
-    #[test]
-    fn version_5_10_with_range_matches_5_7() {
-        // Client proposes 5.10 with range 5 → accepts 5.10 down to 5.5
-        // Should match 5.7 (highest we support in that range)
-        let mut v = [0u8; 16];
-        v[0..4].copy_from_slice(&[0x00, 0x05, 0x0A, 0x05]); // 5.10 with range 5
-        assert_eq!(negotiate_bolt_version(&v), Some(BoltVersion::V5(7)));
-    }
 }

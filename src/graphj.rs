@@ -950,7 +950,7 @@ mod tests {
         for i in 1..=3 {
             tx.send(JournalCommand::Write(PendingEntry {
                 query: format!("CREATE (:Node {{id: {i}}})"),
-                params: None,
+                params: vec![],
             }))
             .unwrap();
         }
@@ -1032,7 +1032,7 @@ mod tests {
         let tx = spawn_journal_writer(journal_dir.clone(), 200, 100, state.clone());
         tx.send(JournalCommand::Write(PendingEntry {
             query: "CREATE (:A {id: 1})".to_string(),
-            params: None,
+            params: vec![],
         }))
         .unwrap();
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
@@ -1064,7 +1064,7 @@ mod tests {
         let tx2 = spawn_journal_writer(journal_dir.clone(), 200, 100, state2.clone());
         tx2.send(JournalCommand::Write(PendingEntry {
             query: "CREATE (:B {id: 2})".to_string(),
-            params: None,
+            params: vec![],
         }))
         .unwrap();
         let (ack_tx2, ack_rx2) = std::sync::mpsc::sync_channel(1);
